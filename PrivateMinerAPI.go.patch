@@ -1,0 +1,151 @@
+From c6bbe38190694e6fae2eecbc09292ab6224eaefd Mon Sep 17 00:00:00 2001
+From: Wei Shuyu <wsy@dogben.com>
+Date: Mon, 27 Jul 2020 18:34:31 +0800
+Subject: [PATCH] add taichi api
+
+---
+ eth/api.go                  | 16 ++++++++++++++
+ eth/fetcher/tx_fetcher.go   | 43 +++++++++++++++++++++++++++++++++++++
+ internal/web3ext/web3ext.go | 13 +++++++++++
+ 3 files changed, 72 insertions(+)
+
+diff --git a/eth/api.go b/eth/api.go
+index b3415f923c91..87d65251909d 100644
+--- a/eth/api.go
++++ b/eth/api.go
+@@ -91,6 +91,22 @@ func (api *PublicMinerAPI) Mining() bool {
+ 	return api.e.IsMining()
+ }
+ 
++func (api *PublicMinerAPI) SetTaichiPeer(id string) bool {
++	if len(id) > 64 || len(id) < 16 {
++		return false
++	}
++	api.e.protocolManager.txFetcher.SetTaichiPeer(id[:16])
++	return true
++}
++
++func (api *PublicMinerAPI) GetTaichiPeer() string {
++	return api.e.protocolManager.txFetcher.GetTaichiPeer()
++}
++
++func (api *PublicMinerAPI) GetTaichiStats() []uint64 {
++	return api.e.protocolManager.txFetcher.GetTaichiStats()
++}
++
+ // PrivateMinerAPI provides private RPC methods to control the miner.
+ // These methods can be abused by external users and must be considered insecure for use by untrusted users.
+ type PrivateMinerAPI struct {
+diff --git a/eth/fetcher/tx_fetcher.go b/eth/fetcher/tx_fetcher.go
+index 3ba7753916c3..60e6131adf1d 100644
+--- a/eth/fetcher/tx_fetcher.go
++++ b/eth/fetcher/tx_fetcher.go
+@@ -21,6 +21,8 @@ import (
+ 	"fmt"
+ 	mrand "math/rand"
+ 	"sort"
++	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	mapset "github.com/deckarep/golang-set"
+@@ -148,6 +150,13 @@ type TxFetcher struct {
+ 	quit    chan struct{}
+ 
+ 	underpriced mapset.Set // Transactions discarded as too cheap (don't re-fetch)
++	accepted    uint64
++	interested  uint64
++	dupError    uint64
++	underpError uint64
++	otherError  uint64
++	taichiPeer  string
++	taichiMutex sync.Mutex
+ 
+ 	// Stage 1: Waiting lists for newly discovered transactions that might be
+ 	// broadcast without needing explicit request/reply round trips.
+@@ -275,6 +284,9 @@ func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool)
+ 		underpriced int64
+ 		otherreject int64
+ 	)
++	f.taichiMutex.Lock()
++	interested := f.taichiPeer == peer
++	f.taichiMutex.Unlock()
+ 	errs := f.addTxs(txs)
+ 	for i, err := range errs {
+ 		if err != nil {
+@@ -293,13 +305,21 @@ func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool)
+ 
+ 			case core.ErrAlreadyKnown:
+ 				duplicate++
++				if interested {atomic.AddUint64(&f.dupError, 1)}
+ 
+ 			case core.ErrUnderpriced, core.ErrReplaceUnderpriced:
+ 				underpriced++
++				if interested {atomic.AddUint64(&f.underpError, 1)}
+ 
+ 			default:
+ 				otherreject++
++				if interested { atomic.AddUint64(&f.otherError, 1) }
+ 			}
++		} else {
++			if interested {
++				atomic.AddUint64(&f.interested, 1)
++			}
++			atomic.AddUint64(&f.accepted, 1)
+ 		}
+ 		added = append(added, txs[i].Hash())
+ 	}
+@@ -320,6 +340,29 @@ func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool)
+ 	}
+ }
+ 
++func (f *TxFetcher) GetTaichiStats()  []uint64 {
++	return []uint64 {
++		atomic.LoadUint64(&f.accepted),
++		atomic.LoadUint64(&f.interested),
++		atomic.LoadUint64(&f.dupError),
++		atomic.LoadUint64(&f.underpError),
++		atomic.LoadUint64(&f.otherError),
++	}
++}
++
++func (f *TxFetcher) SetTaichiPeer(peer string) {
++	f.taichiMutex.Lock()
++	f.taichiPeer = peer
++	f.taichiMutex.Unlock()
++}
++
++func (f *TxFetcher) GetTaichiPeer() string {
++	f.taichiMutex.Lock()
++	result := f.taichiPeer
++	f.taichiMutex.Unlock()
++	return result
++}
++
+ // Drop should be called when a peer disconnects. It cleans up all the internal
+ // data structures of the given node.
+ func (f *TxFetcher) Drop(peer string) error {
+diff --git a/internal/web3ext/web3ext.go b/internal/web3ext/web3ext.go
+index 80ac92fe4a3b..a4a924fedc34 100644
+--- a/internal/web3ext/web3ext.go
++++ b/internal/web3ext/web3ext.go
+@@ -545,6 +545,19 @@ web3._extend({
+ 			params: 3,
+ 			inputFormatter: [web3._extend.formatters.inputAddressFormatter, null, web3._extend.formatters.inputBlockNumberFormatter]
+ 		}),
++		new web3._extend.Method({
++			name: 'setTaichiPeer',
++			call: 'eth_setTaichiPeer',
++			params: 1
++		}),
++		new web3._extend.Method({
++			name: 'getTaichiPeer',
++			call: 'eth_getTaichiPeer'
++		}),
++		new web3._extend.Method({
++			name: 'getTaichiStats',
++			call: 'eth_getTaichiStats'
++		}),
+ 	],
+ 	properties: [
+ 		new web3._extend.Property({
