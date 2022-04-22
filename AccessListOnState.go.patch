@@ -1,0 +1,218 @@
+From 5064bb2eebb18268abd5fbab4824643b917582d4 Mon Sep 17 00:00:00 2001
+From: 0x2 <code0x2@protonmail.com>
+Date: Tue, 15 Mar 2022 22:51:46 -0700
+Subject: [PATCH] add features
+
+---
+ internal/ethapi/api.go | 154 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 154 insertions(+)
+
+diff --git a/internal/ethapi/api.go b/internal/ethapi/api.go
+index 49115e5f3975..9d2d11855c27 100644
+--- a/internal/ethapi/api.go
++++ b/internal/ethapi/api.go
+@@ -1483,6 +1483,74 @@ func AccessList(ctx context.Context, b Backend, blockNrOrHash rpc.BlockNumberOrH
+ 	}
+ }
+ 
++// Creates an access list on top of given state
++// identical to AccessList, with the exception of state is loaded in arguments
++func AccessListOnState(ctx context.Context, b Backend, header *types.Header, db *state.StateDB, args TransactionArgs) (acl types.AccessList, gasUsed uint64, vmErr error, err error) {
++	// If the gas amount is not set, extract this as it will depend on access
++	// lists and we'll need to reestimate every time
++	nogas := args.Gas == nil
++
++	// Ensure any missing fields are filled, extract the recipient and input data
++	if err := args.setDefaults(ctx, b); err != nil {
++		return nil, 0, nil, err
++	}
++	var to common.Address
++	if args.To != nil {
++		to = *args.To
++	} else {
++		to = crypto.CreateAddress(args.from(), uint64(*args.Nonce))
++	}
++	// Retrieve the precompiles since they don't need to be added to the access list
++	isPostMerge := header.Difficulty.Cmp(common.Big0) == 0
++	// Retrieve the precompiles since they don't need to be added to the access list
++	precompiles := vm.ActivePrecompiles(b.ChainConfig().Rules(header.Number, isPostMerge))
++
++	// Create an initial tracer
++	prevTracer := logger.NewAccessListTracer(nil, args.from(), to, precompiles)
++	if args.AccessList != nil {
++		prevTracer = logger.NewAccessListTracer(*args.AccessList, args.from(), to, precompiles)
++	}
++	for {
++		// Retrieve the current access list to expand
++		accessList := prevTracer.AccessList()
++		log.Trace("Creating access list", "input", accessList)
++
++		// If no gas amount was specified, each unique access list needs it's own
++		// gas calculation. This is quite expensive, but we need to be accurate
++		// and it's convered by the sender only anyway.
++		if nogas {
++			args.Gas = nil
++			if err := args.setDefaults(ctx, b); err != nil {
++				return nil, 0, nil, err // shouldn't happen, just in case
++			}
++		}
++
++		statedb := db.Copy() // woops shouldn't have removed this lol
++		// Set the accesslist to the last al
++		args.AccessList = &accessList
++		msg, err := args.ToMessage(b.RPCGasCap(), header.BaseFee)
++		if err != nil {
++			return nil, 0, nil, err
++		}
++
++		// Apply the transaction with the access list tracer
++		tracer := logger.NewAccessListTracer(accessList, args.from(), to, precompiles)
++		config := vm.Config{Tracer: tracer, Debug: true, NoBaseFee: true}
++		vmenv, _, err := b.GetEVM(ctx, msg, statedb, header, &config)
++		if err != nil {
++			return nil, 0, nil, err
++		}
++		res, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas()))
++		if err != nil {
++			return nil, 0, nil, fmt.Errorf("failed to apply transaction: %v err: %v", args.toTransaction().Hash(), err)
++		}
++		if tracer.Equal(prevTracer) {
++			return accessList, res.UsedGas, res.Err, nil
++		}
++		prevTracer = tracer
++	}
++}
++
+ // PublicTransactionPoolAPI exposes methods for the RPC interface
+ type PublicTransactionPoolAPI struct {
+ 	b         Backend
+@@ -2246,6 +2314,8 @@ type CallBundleArgs struct {
+ 	GasLimit               *uint64               `json:"gasLimit"`
+ 	Difficulty             *big.Int              `json:"difficulty"`
+ 	BaseFee                *big.Int              `json:"baseFee"`
++	SimulationLogs         bool                  `json:"simulationLogs"`
++	CreateAccessList       bool                  `json:"createAccessList"`
+ }
+ 
+ // CallBundle will simulate a bundle of transactions at the top of a given block
+@@ -2345,6 +2415,8 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
+ 		coinbaseBalanceBeforeTx := state.GetBalance(coinbase)
+ 		state.Prepare(tx.Hash(), i)
+ 
++		accessListState := state.Copy() // create a copy just in case we use it later for access list creation
++
+ 		receipt, result, err := core.ApplyTransactionWithResult(s.b.ChainConfig(), s.chain, &coinbase, gp, state, header, tx, &header.GasUsed, vmconfig)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("err: %w; txhash %s", err, tx.Hash())
+@@ -2384,6 +2456,46 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
+ 			hex.Encode(dst, result.Return())
+ 			jsonResult["value"] = "0x" + string(dst)
+ 		}
++		// if simulation logs are requested append it to logs
++		if args.SimulationLogs {
++			jsonResult["logs"] = receipt.Logs
++		}
++		// if an access list is requested create and append
++		if args.CreateAccessList {
++			// ifdk another way to fill all values so this will have to do - x2
++			txArgGas := hexutil.Uint64(tx.Gas())
++			txArgNonce := hexutil.Uint64(tx.Nonce())
++			txArgData := hexutil.Bytes(tx.Data())
++			txargs := TransactionArgs{
++				From:    &from,
++				To:      tx.To(),
++				Gas:     &txArgGas,
++				Nonce:   &txArgNonce,
++				Data:    &txArgData,
++				Value:   (*hexutil.Big)(tx.Value()),
++				ChainID: (*hexutil.Big)(tx.ChainId()),
++			}
++			if tx.GasFeeCap().Cmp(big.NewInt(0)) == 0 { // no maxbasefee, set gasprice instead
++				txargs.GasPrice = (*hexutil.Big)(tx.GasPrice())
++			} else { // otherwise set base and priority fee
++				txargs.MaxFeePerGas = (*hexutil.Big)(tx.GasFeeCap())
++				txargs.MaxPriorityFeePerGas = (*hexutil.Big)(tx.GasTipCap())
++			}
++			acl, gasUsed, vmerr, err := AccessListOnState(ctx, s.b, header, accessListState, txargs)
++			if err == nil {
++				if gasUsed != receipt.GasUsed {
++					log.Info("Gas used in receipt differ from accesslist", "receipt", receipt.GasUsed, "acl", gasUsed) // weird bug but it works
++				}
++				if vmerr != nil {
++					log.Info("CallBundle accesslist creation encountered vmerr", "vmerr", vmerr)
++				}
++				jsonResult["accessList"] = acl
++
++			} else {
++				log.Info("CallBundle accesslist creation encountered err", "err", err)
++				jsonResult["accessList"] = acl //
++			} // return the empty accesslist either way
++		}
+ 		coinbaseDiffTx := new(big.Int).Sub(state.GetBalance(coinbase), coinbaseBalanceBeforeTx)
+ 		jsonResult["coinbaseDiff"] = coinbaseDiffTx.String()
+ 		jsonResult["gasFees"] = gasFeesTx.String()
+@@ -2415,8 +2527,11 @@ type EstimateGasBundleArgs struct {
+ 	Coinbase               *string               `json:"coinbase"`
+ 	Timestamp              *uint64               `json:"timestamp"`
+ 	Timeout                *int64                `json:"timeout"`
++	//SimulationLogs         bool                  `json:"simulationLogs"`
++	CreateAccessList bool `json:"createAccessList"`
+ }
+ 
++// im lazy to create a few extra core functions to return logs here, maybe sometime later or if someone else does it
+ func (s *BundleAPI) EstimateGasBundle(ctx context.Context, args EstimateGasBundleArgs) (map[string]interface{}, error) {
+ 	if len(args.Txs) == 0 {
+ 		return nil, errors.New("bundle missing txs")
+@@ -2495,6 +2610,8 @@ func (s *BundleAPI) EstimateGasBundle(ctx context.Context, args EstimateGasBundl
+ 		// New random hash since its a call
+ 		statedb.Prepare(randomHash, i)
+ 
++		accessListState := statedb.Copy() // create a copy just in case we use it later for access list creation
++
+ 		// Convert tx args to msg to apply state transition
+ 		msg, err := txArgs.ToMessage(globalGasCap, header.BaseFee)
+ 		if err != nil {
+@@ -2521,6 +2638,43 @@ func (s *BundleAPI) EstimateGasBundle(ctx context.Context, args EstimateGasBundl
+ 		jsonResult := map[string]interface{}{
+ 			"gasUsed": result.UsedGas,
+ 		}
++
++		// if simulation logs are requested append it to logs
++		// if an access list is requested create and append
++		if args.CreateAccessList {
++			// welp guess we're copying these again sigh
++			txArgFrom := msg.From()
++			txArgGas := hexutil.Uint64(msg.Gas())
++			txArgNonce := hexutil.Uint64(msg.Nonce())
++			txArgData := hexutil.Bytes(msg.Data())
++			txargs := TransactionArgs{
++				From:    &txArgFrom,
++				To:      msg.To(),
++				Gas:     &txArgGas,
++				Nonce:   &txArgNonce,
++				Data:    &txArgData,
++				ChainID: (*hexutil.Big)(s.chain.Config().ChainID),
++				Value:   (*hexutil.Big)(msg.Value()),
++			}
++			if msg.GasFeeCap().Cmp(big.NewInt(0)) == 0 { // no maxbasefee, set gasprice instead
++				txargs.GasPrice = (*hexutil.Big)(msg.GasPrice())
++			} else { // otherwise set base and priority fee
++				txargs.MaxFeePerGas = (*hexutil.Big)(msg.GasFeeCap())
++				txargs.MaxPriorityFeePerGas = (*hexutil.Big)(msg.GasTipCap())
++			}
++			acl, _, vmerr, err := AccessListOnState(ctx, s.b, header, accessListState, txargs)
++			if err == nil {
++				if vmerr != nil {
++					log.Info("CallBundle accesslist creation encountered vmerr", "vmerr", vmerr)
++				}
++				jsonResult["accessList"] = acl
++
++			} else {
++				log.Info("CallBundle accesslist creation encountered err", "err", err)
++				jsonResult["accessList"] = acl //
++			} // return the empty accesslist either way
++		}
++
+ 		results = append(results, jsonResult)
+ 	}
+ 
