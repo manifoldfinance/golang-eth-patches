@@ -1,0 +1,579 @@
+From 52d0544407d1142eadac89f8bb99f2e967e2d6b3 Mon Sep 17 00:00:00 2001
+From: Dmarz <danmarzec@icloud.com>
+Date: Mon, 28 Mar 2022 15:27:46 -0400
+Subject: [PATCH] Feature : Unsigned Txn Bundle Simulation (#45)
+
+* first attempt at cherry picking eth_callBundle
+
+* intermediate comments
+
+* intermediate notes, not working
+
+* commenting out code to test core functionality
+
+* add logs
+
+* redo param parse
+
+* comment out bundleGasPrice bc div by 0
+
+* call tx.from()
+
+* try new struct logger tracert
+
+* implied type on logger
+
+* add trace results to call
+
+* payload changes
+---
+ core/state_processor.go    | 110 ++++++++++++++++++++++++
+ core/tx_pool.go            |  36 ++++----
+ core/types/transaction.go  |   1 +
+ eth/backend.go             |   2 +-
+ internal/ethapi/api.go     | 172 +++++++++++++++++++++++++++++++++++++
+ internal/ethapi/backend.go |   7 +-
+ les/client.go              |   2 +-
+ 7 files changed, 309 insertions(+), 21 deletions(-)
+
+diff --git a/core/state_processor.go b/core/state_processor.go
+index 16ce3f239897..c0f4338da5df 100644
+--- a/core/state_processor.go
++++ b/core/state_processor.go
+@@ -27,6 +27,7 @@ import (
+ 	"github.com/ethereum/go-ethereum/core/types"
+ 	"github.com/ethereum/go-ethereum/core/vm"
+ 	"github.com/ethereum/go-ethereum/crypto"
++	"github.com/ethereum/go-ethereum/eth/tracers/logger"
+ 	"github.com/ethereum/go-ethereum/params"
+ )
+ 
+@@ -141,6 +142,54 @@ func applyTransaction(msg types.Message, config *params.ChainConfig, bc ChainCon
+ 	return receipt, err
+ }
+ 
++func applyTransactionWithResult(msg types.Message, config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, msgTx types.Message, usedGas *uint64, evm *vm.EVM, tracer *logger.StructLogger) (*types.Receipt, *ExecutionResult, []StructLogRes, error) {
++	// Create a new context to be used in the EVM environment.
++	txContext := NewEVMTxContext(msg)
++	evm.Reset(txContext, statedb)
++
++	// Apply the transaction to the current state (included in the env).
++	result, err := ApplyMessage(evm, msg, gp)
++	if err != nil {
++		return nil, nil, nil, err
++	}
++
++	traceResult := FormatLogs(tracer.StructLogs())
++
++	if err != nil {
++		return nil, nil, nil, err
++	}
++	// Update the state with pending changes.
++	var root []byte
++	if config.IsByzantium(header.Number) {
++		statedb.Finalise(true)
++	} else {
++		root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes()
++	}
++	*usedGas += result.UsedGas
++
++	// Create a new receipt for the transaction, storing the intermediate root and gas used
++	// by the tx.
++	receipt := &types.Receipt{Type: 0, PostState: root, CumulativeGasUsed: *usedGas}
++	if result.Failed() {
++		receipt.Status = types.ReceiptStatusFailed
++	} else {
++		receipt.Status = types.ReceiptStatusSuccessful
++	}
++	// receipt.TxHash = tx.Hash()
++	receipt.GasUsed = result.UsedGas
++
++	// If the transaction created a contract, store the creation address in the receipt.
++	// if msg.To() == nil {
++	// 	receipt.ContractAddress = crypto.CreateAddress(evm.TxContext.Origin, tx.Nonce())
++	// }
++
++	// Set the receipt logs and create the bloom filter.
++	receipt.BlockHash = header.Hash()
++	receipt.BlockNumber = header.Number
++	receipt.TransactionIndex = uint(statedb.TxIndex())
++	return receipt, result, traceResult, err
++}
++
+ // ApplyTransaction attempts to apply a transaction to the given state database
+ // and uses the input parameters for its environment. It returns the receipt
+ // for the transaction, gas used and an error if the transaction failed,
+@@ -155,3 +204,64 @@ func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *commo
+ 	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, config, cfg)
+ 	return applyTransaction(msg, config, bc, author, gp, statedb, header.Number, header.Hash(), tx, usedGas, vmenv)
+ }
++
++func ApplyUnsignedTransactionWithResult(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, msg types.Message, usedGas *uint64, cfg vm.Config) (*types.Receipt, *ExecutionResult, []StructLogRes, error) {
++	// Create struct logger to get JSON stack traces
++	tracer := logger.NewStructLogger(nil)
++
++	// Create a new context to be used in the EVM environment
++	blockContext := NewEVMBlockContext(header, bc, author)
++	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, config, vm.Config{Debug: true, Tracer: tracer, NoBaseFee: true})
++	return applyTransactionWithResult(msg, config, bc, author, gp, statedb, header, msg, usedGas, vmenv, tracer)
++}
++
++// StructLogRes stores a structured log emitted by the EVM while replaying a
++// transaction in debug mode
++type StructLogRes struct {
++	Pc      uint64             `json:"pc"`
++	Op      string             `json:"op"`
++	Gas     uint64             `json:"gas"`
++	GasCost uint64             `json:"gasCost"`
++	Depth   int                `json:"depth"`
++	Error   string             `json:"error,omitempty"`
++	Stack   *[]string          `json:"stack,omitempty"`
++	Memory  *[]string          `json:"memory,omitempty"`
++	Storage *map[string]string `json:"storage,omitempty"`
++}
++
++// FormatLogs formats EVM returned structured logs for json output
++func FormatLogs(logs []logger.StructLog) []StructLogRes {
++	formatted := make([]StructLogRes, len(logs))
++	for index, trace := range logs {
++		formatted[index] = StructLogRes{
++			Pc:      trace.Pc,
++			Op:      trace.Op.String(),
++			Gas:     trace.Gas,
++			GasCost: trace.GasCost,
++			Depth:   trace.Depth,
++			Error:   trace.ErrorString(),
++		}
++		if trace.Stack != nil {
++			stack := make([]string, len(trace.Stack))
++			for i, stackValue := range trace.Stack {
++				stack[i] = stackValue.Hex()
++			}
++			formatted[index].Stack = &stack
++		}
++		if trace.Memory != nil {
++			memory := make([]string, 0, (len(trace.Memory)+31)/32)
++			for i := 0; i+32 <= len(trace.Memory); i += 32 {
++				memory = append(memory, fmt.Sprintf("%x", trace.Memory[i:i+32]))
++			}
++			formatted[index].Memory = &memory
++		}
++		if trace.Storage != nil {
++			storage := make(map[string]string)
++			for i, storageValue := range trace.Storage {
++				storage[fmt.Sprintf("%x", i)] = fmt.Sprintf("%x", storageValue)
++			}
++			formatted[index].Storage = &storage
++		}
++	}
++	return formatted
++}
+diff --git a/core/tx_pool.go b/core/tx_pool.go
+index 141410602ea5..c108355f204e 100644
+--- a/core/tx_pool.go
++++ b/core/tx_pool.go
+@@ -395,7 +395,7 @@ func (pool *TxPool) loop() {
+ 						pool.removeTx(tx.Hash(), true)
+ 					}
+ 					pool.dropTxFeed.Send(DropTxsEvent{
+-						Txs: list,
++						Txs:    list,
+ 						Reason: dropOld,
+ 					})
+ 					queuedEvictionMeter.Mark(int64(len(list)))
+@@ -474,7 +474,7 @@ func (pool *TxPool) SetGasPrice(price *big.Int) {
+ 		}
+ 		pool.priced.Removed(len(drop))
+ 		pool.dropTxFeed.Send(DropTxsEvent{
+-			Txs: drop,
++			Txs:    drop,
+ 			Reason: dropGasPriceUpdated,
+ 		})
+ 	}
+@@ -728,7 +728,7 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
+ 			pool.removeTx(tx.Hash(), false)
+ 		}
+ 		pool.dropTxFeed.Send(DropTxsEvent{
+-			Txs: drop,
++			Txs:    drop,
+ 			Reason: dropUnderpriced,
+ 		})
+ 	}
+@@ -747,8 +747,8 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
+ 			pool.priced.Removed(1)
+ 			pendingReplaceMeter.Mark(1)
+ 			pool.dropTxFeed.Send(DropTxsEvent{
+-				Txs: []*types.Transaction{old},
+-				Reason: dropReplaced,
++				Txs:         []*types.Transaction{old},
++				Reason:      dropReplaced,
+ 				Replacement: tx,
+ 			})
+ 		}
+@@ -803,7 +803,7 @@ func (pool *TxPool) enqueueTx(hash common.Hash, tx *types.Transaction, local boo
+ 		pool.priced.Removed(1)
+ 		queuedReplaceMeter.Mark(1)
+ 		pool.dropTxFeed.Send(DropTxsEvent{
+-			Txs: []*types.Transaction{old},
++			Txs:    []*types.Transaction{old},
+ 			Reason: dropReplaced,
+ 		})
+ 	} else {
+@@ -863,7 +863,7 @@ func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.T
+ 		pool.priced.Removed(1)
+ 		pendingReplaceMeter.Mark(1)
+ 		pool.dropTxFeed.Send(DropTxsEvent{
+-			Txs: []*types.Transaction{old},
++			Txs:    []*types.Transaction{old},
+ 			Reason: dropReplaced,
+ 		})
+ 	} else {
+@@ -965,7 +965,7 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
+ 		}
+ 		if err != nil {
+ 			pool.rejectTxFeed.Send(RejectedTxEvent{
+-				Tx: txs[nilSlot],
++				Tx:     txs[nilSlot],
+ 				Reason: err,
+ 			})
+ 		}
+@@ -1065,7 +1065,7 @@ func (pool *TxPool) removeTx(hash common.Hash, outofbound bool) {
+ 			// Reduce the pending counter
+ 			pendingGauge.Dec(int64(1 + len(invalids)))
+ 			pool.dropTxFeed.Send(DropTxsEvent{
+-				Txs: invalids,
++				Txs:    invalids,
+ 				Reason: dropUnexecutable,
+ 			})
+ 			return
+@@ -1375,7 +1375,7 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) []*types.Trans
+ 		}
+ 		log.Trace("Removed old queued transactions", "count", len(forwards))
+ 		pool.dropTxFeed.Send(DropTxsEvent{
+-			Txs: forwards,
++			Txs:    forwards,
+ 			Reason: dropLowNonce,
+ 		})
+ 		// Drop all transactions that are too costly (low balance or out of gas)
+@@ -1387,7 +1387,7 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) []*types.Trans
+ 		log.Trace("Removed unpayable queued transactions", "count", len(drops))
+ 		queuedNofundsMeter.Mark(int64(len(drops)))
+ 		pool.dropTxFeed.Send(DropTxsEvent{
+-			Txs: drops,
++			Txs:    drops,
+ 			Reason: dropUnpayable,
+ 		})
+ 
+@@ -1413,7 +1413,7 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) []*types.Trans
+ 			}
+ 			queuedRateLimitMeter.Mark(int64(len(caps)))
+ 			pool.dropTxFeed.Send(DropTxsEvent{
+-				Txs: caps,
++				Txs:    caps,
+ 				Reason: dropAccountCap,
+ 			})
+ 		}
+@@ -1481,7 +1481,7 @@ func (pool *TxPool) truncatePending() {
+ 						log.Trace("Removed fairness-exceeding pending transaction", "hash", hash)
+ 					}
+ 					pool.dropTxFeed.Send(DropTxsEvent{
+-						Txs: caps,
++						Txs:    caps,
+ 						Reason: dropAccountCap,
+ 					})
+ 					pool.priced.Removed(len(caps))
+@@ -1512,7 +1512,7 @@ func (pool *TxPool) truncatePending() {
+ 					log.Trace("Removed fairness-exceeding pending transaction", "hash", hash)
+ 				}
+ 				pool.dropTxFeed.Send(DropTxsEvent{
+-					Txs: caps,
++					Txs:    caps,
+ 					Reason: dropAccountCap,
+ 				})
+ 				pool.priced.Removed(len(caps))
+@@ -1560,7 +1560,7 @@ func (pool *TxPool) truncateQueue() {
+ 				pool.removeTx(tx.Hash(), true)
+ 			}
+ 			pool.dropTxFeed.Send(DropTxsEvent{
+-				Txs: txs,
++				Txs:    txs,
+ 				Reason: dropTruncating,
+ 			})
+ 			drop -= size
+@@ -1574,7 +1574,7 @@ func (pool *TxPool) truncateQueue() {
+ 			drop--
+ 			queuedRateLimitMeter.Mark(1)
+ 			pool.dropTxFeed.Send(DropTxsEvent{
+-				Txs: []*types.Transaction{txs[i]},
++				Txs:    []*types.Transaction{txs[i]},
+ 				Reason: dropTruncating,
+ 			})
+ 		}
+@@ -1601,7 +1601,7 @@ func (pool *TxPool) demoteUnexecutables() {
+ 			log.Trace("Removed old pending transaction", "hash", hash)
+ 		}
+ 		pool.dropTxFeed.Send(DropTxsEvent{
+-			Txs: olds,
++			Txs:    olds,
+ 			Reason: dropLowNonce,
+ 		})
+ 		// Drop all transactions that are too costly (low balance or out of gas), and queue any invalids back for later
+@@ -1612,7 +1612,7 @@ func (pool *TxPool) demoteUnexecutables() {
+ 			pool.all.Remove(hash)
+ 		}
+ 		pool.dropTxFeed.Send(DropTxsEvent{
+-			Txs: drops,
++			Txs:    drops,
+ 			Reason: dropUnpayable,
+ 		})
+ 		pool.priced.Removed(len(olds) + len(drops))
+diff --git a/core/types/transaction.go b/core/types/transaction.go
+index 83f1766e67e2..2b80c68e5d7f 100644
+--- a/core/types/transaction.go
++++ b/core/types/transaction.go
+@@ -611,6 +611,7 @@ func (tx *Transaction) AsMessage(s Signer, baseFee *big.Int) (Message, error) {
+ 		msg.gasPrice = math.BigMin(msg.gasPrice.Add(msg.gasTipCap, baseFee), msg.gasFeeCap)
+ 	}
+ 	var err error
++	// recover sender address
+ 	msg.from, err = Sender(s, tx)
+ 	return msg, err
+ }
+diff --git a/eth/backend.go b/eth/backend.go
+index a53982166d78..3609e3dda5a4 100644
+--- a/eth/backend.go
++++ b/eth/backend.go
+@@ -292,7 +292,7 @@ func makeExtraData(extra []byte) []byte {
+ // APIs return the collection of RPC services the ethereum package offers.
+ // NOTE, some of these services probably need to be moved to somewhere else.
+ func (s *Ethereum) APIs() []rpc.API {
+-	apis := ethapi.GetAPIs(s.APIBackend)
++	apis := ethapi.GetAPIs(s.APIBackend, s.BlockChain())
+ 
+ 	// Append any APIs exposed explicitly by the consensus engine
+ 	apis = append(apis, s.engine.APIs(s.BlockChain())...)
+diff --git a/internal/ethapi/api.go b/internal/ethapi/api.go
+index 65e34752bf41..f7f3bdf5f277 100644
+--- a/internal/ethapi/api.go
++++ b/internal/ethapi/api.go
+@@ -18,6 +18,8 @@ package ethapi
+ 
+ import (
+ 	"context"
++	"crypto/rand"
++	"encoding/hex"
+ 	"errors"
+ 	"fmt"
+ 	"math/big"
+@@ -2083,3 +2085,173 @@ func toHexSlice(b [][]byte) []string {
+ 	}
+ 	return r
+ }
++
++// ---------------------------------------------------------------- FlashBots inspired code ----------------------------------------------------------------
++
++// PrivateTxBundleAPI offers an API for accepting bundled transactions
++type PrivateTxBundleAPI struct {
++	b Backend
++}
++
++// NewPrivateTxBundleAPI creates a new Tx Bundle API instance.
++func NewPrivateTxBundleAPI(b Backend) *PrivateTxBundleAPI {
++	return &PrivateTxBundleAPI{b}
++}
++
++// BundleAPI offers an API for accepting bundled transactions
++type BundleAPI struct {
++	b     Backend
++	chain *core.BlockChain
++}
++
++// NewBundleAPI creates a new Tx Bundle API instance.
++func NewBundleAPI(b Backend, chain *core.BlockChain) *BundleAPI {
++	return &BundleAPI{b, chain}
++}
++
++// CallBundleArgs represents the arguments for a call.
++type CallBundleArgs struct {
++	Txs                    []TransactionArgs     `json:"txs"`
++	BlockNumber            rpc.BlockNumber       `json:"blockNumber"`
++	StateBlockNumberOrHash rpc.BlockNumberOrHash `json:"stateBlockNumber"`
++	Coinbase               *string               `json:"coinbase"`
++	Timestamp              *uint64               `json:"timestamp"`
++	Timeout                *int64                `json:"timeout"`
++	GasLimit               *uint64               `json:"gasLimit"`
++	Difficulty             *big.Int              `json:"difficulty"`
++	BaseFee                *big.Int              `json:"baseFee"`
++}
++
++// CallBundle will simulate a bundle of transactions at the top of a given block
++// number with the state of another (or the same) block. This can be used to
++// simulate future blocks with the current state, or it can be used to simulate
++// a past block.
++// The sender is responsible for signing the transactions and using the correct
++// nonce and ensuring validity
++func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[string]interface{}, error) {
++	if len(args.Txs) == 0 {
++		return nil, errors.New("bundle missing unsigned txs")
++	}
++	if args.BlockNumber == 0 {
++		return nil, errors.New("bundle missing blockNumber")
++	}
++
++	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
++
++	timeoutMilliSeconds := int64(5000)
++	if args.Timeout != nil {
++		timeoutMilliSeconds = *args.Timeout
++	}
++	timeout := time.Millisecond * time.Duration(timeoutMilliSeconds)
++	state, parent, err := s.b.StateAndHeaderByNumberOrHash(ctx, args.StateBlockNumberOrHash)
++	if state == nil || err != nil {
++		return nil, err
++	}
++	blockNumber := big.NewInt(int64(args.BlockNumber))
++
++	timestamp := parent.Time + 1
++	if args.Timestamp != nil {
++		timestamp = *args.Timestamp
++	}
++	coinbase := parent.Coinbase
++	if args.Coinbase != nil {
++		coinbase = common.HexToAddress(*args.Coinbase)
++	}
++	difficulty := parent.Difficulty
++	if args.Difficulty != nil {
++		difficulty = args.Difficulty
++	}
++	gasLimit := parent.GasLimit
++	if args.GasLimit != nil {
++		gasLimit = *args.GasLimit
++	}
++	var baseFee *big.Int
++	if args.BaseFee != nil {
++		baseFee = args.BaseFee
++	} else if s.b.ChainConfig().IsLondon(big.NewInt(args.BlockNumber.Int64())) {
++		baseFee = misc.CalcBaseFee(s.b.ChainConfig(), parent)
++	}
++	header := &types.Header{
++		ParentHash: parent.Hash(),
++		Number:     blockNumber,
++		GasLimit:   gasLimit,
++		Time:       timestamp,
++		Difficulty: difficulty,
++		Coinbase:   coinbase,
++		BaseFee:    baseFee,
++	}
++	// Setup context so it may be cancelled the call has completed
++	// or, in case of unmetered gas, setup a context with a timeout.
++	var cancel context.CancelFunc
++	if timeout > 0 {
++		ctx, cancel = context.WithTimeout(ctx, timeout)
++	} else {
++		ctx, cancel = context.WithCancel(ctx)
++	}
++	// Make sure the context is cancelled when the call has completed
++	// this makes sure resources are cleaned up.
++	defer cancel()
++
++	vmconfig := vm.Config{}
++
++	// Setup the gas pool (also for unmetered requests)
++	// and apply the message.
++	gp := new(core.GasPool).AddGas(math.MaxUint64)
++
++	results := []map[string]interface{}{}
++
++	var totalGasUsed uint64
++	gasFees := new(big.Int)
++
++	// RPC Call gas cap
++	globalGasCap := s.b.RPCGasCap()
++
++	for i, tx := range args.Txs {
++		// Since its a txCall we'll just prepare the
++		// state with a random hash
++		var randomHash common.Hash
++		rand.Read(randomHash[:])
++		// New random hash since its a call
++		state.Prepare(randomHash, i)
++
++		msg, err := tx.ToMessage(globalGasCap, header.BaseFee)
++		if err != nil {
++			return nil, err
++		}
++
++		receipt, result, traceResult, err := core.ApplyUnsignedTransactionWithResult(s.b.ChainConfig(), s.chain, &coinbase, gp, state, header, msg, &header.GasUsed, vmconfig)
++		if err != nil {
++			return nil, fmt.Errorf("err: %w; txhash %s", err, tx.From)
++		}
++
++		jsonResult := map[string]interface{}{
++			"gasUsed":     receipt.GasUsed,
++			"fromAddress": tx.from(),
++			"toAddress":   tx.To,
++			"traceResult": traceResult,
++		}
++		totalGasUsed += receipt.GasUsed
++		if result.Err != nil {
++			jsonResult["error"] = result.Err.Error()
++			revert := result.Revert()
++			if len(revert) > 0 {
++				jsonResult["revert"] = string(revert)
++			}
++		} else {
++			dst := make([]byte, hex.EncodedLen(len(result.Return())))
++			hex.Encode(dst, result.Return())
++			jsonResult["value"] = "0x" + string(dst)
++		}
++
++		results = append(results, jsonResult)
++	}
++
++	ret := map[string]interface{}{}
++	ret["results"] = results
++	ret["gasFees"] = gasFees.String()
++	ret["gasUsed"] = totalGasUsed
++	ret["blockNumber"] = parent.Number.Int64()
++
++	ret["args"] = header
++	return ret, nil
++}
+diff --git a/internal/ethapi/backend.go b/internal/ethapi/backend.go
+index 362b1bf02d35..93aebf337625 100644
+--- a/internal/ethapi/backend.go
++++ b/internal/ethapi/backend.go
+@@ -97,7 +97,7 @@ type Backend interface {
+ 	Engine() consensus.Engine
+ }
+ 
+-func GetAPIs(apiBackend Backend) []rpc.API {
++func GetAPIs(apiBackend Backend, chain *core.BlockChain) []rpc.API {
+ 	nonceLock := new(AddrLocker)
+ 	return []rpc.API{
+ 		{
+@@ -139,6 +139,11 @@ func GetAPIs(apiBackend Backend) []rpc.API {
+ 			Version:   "1.0",
+ 			Service:   NewPrivateAccountAPI(apiBackend, nonceLock),
+ 			Public:    false,
++		}, {
++			Namespace: "eth",
++			Version:   "1.0",
++			Service:   NewBundleAPI(apiBackend, chain),
++			Public:    true,
+ 		},
+ 	}
+ }
+diff --git a/les/client.go b/les/client.go
+index 43207f3443ec..922c51627824 100644
+--- a/les/client.go
++++ b/les/client.go
+@@ -282,7 +282,7 @@ func (s *LightDummyAPI) Mining() bool {
+ // APIs returns the collection of RPC services the ethereum package offers.
+ // NOTE, some of these services probably need to be moved to somewhere else.
+ func (s *LightEthereum) APIs() []rpc.API {
+-	apis := ethapi.GetAPIs(s.ApiBackend)
++	apis := ethapi.GetAPIs(s.ApiBackend, nil)
+ 	apis = append(apis, s.engine.APIs(s.BlockChain().HeaderChain())...)
+ 	return append(apis, []rpc.API{
+ 		{
