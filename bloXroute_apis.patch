@@ -1,0 +1,1996 @@
+From f8c054707e1eed4d32949f2c74bab15a37c8c091 Mon Sep 17 00:00:00 2001
+From: Kevin Chen <kevin@bloxroute.com>
+Date: Thu, 3 Feb 2022 15:50:52 -0600
+Subject: [PATCH 1/7] Add config parameters for blxr_tx API/auth endpoints
+
+---
+ cmd/geth/main.go           |  2 ++
+ cmd/utils/flags.go         | 28 ++++++++++++++++++++++++++++
+ eth/api_backend.go         |  8 ++++++++
+ eth/ethconfig/config.go    |  8 ++++++++
+ internal/ethapi/backend.go |  2 ++
+ les/api_backend.go         |  8 ++++++++
+ 6 files changed, 56 insertions(+)
+
+diff --git a/cmd/geth/main.go b/cmd/geth/main.go
+index a6f7b2d504be..62ada14d457b 100644
+--- a/cmd/geth/main.go
++++ b/cmd/geth/main.go
+@@ -184,6 +184,8 @@ var (
+ 		utils.RPCGlobalEVMTimeoutFlag,
+ 		utils.RPCGlobalTxFeeCapFlag,
+ 		utils.AllowUnprotectedTxs,
++		utils.BxAPIEndpointsFlag,
++		utils.BxAPIAuthHeaderFlag,
+ 	}
+ 
+ 	metricsFlags = []cli.Flag{
+diff --git a/cmd/utils/flags.go b/cmd/utils/flags.go
+index 57d9b87958ce..dd0319b2d4a0 100644
+--- a/cmd/utils/flags.go
++++ b/cmd/utils/flags.go
+@@ -794,6 +794,18 @@ var (
+ 		Name:  "catalyst",
+ 		Usage: "Catalyst mode (eth2 integration testing)",
+ 	}
++
++	// bloXroute flags
++	BxAPIEndpointsFlag = cli.StringFlag{
++		Name:  "bx.api.endpoints",
++		Usage: "Comma separated list of bloXroute RPC endpoints to send transactions to",
++		Value: "https://api.blxrbdn.com",
++	}
++
++	BxAPIAuthHeaderFlag = cli.StringFlag{
++		Name:  "bx.api.auth",
++		Usage: "bloXroute account authorization header (see https://docs.bloxroute.com/apis/authorization-headers)",
++	}
+ )
+ 
+ // MakeDataDir retrieves the currently requested data directory, terminating
+@@ -1059,6 +1071,21 @@ func setLes(ctx *cli.Context, cfg *ethconfig.Config) {
+ 	}
+ }
+ 
++func setBx(ctx *cli.Context, cfg *ethconfig.Config) {
++	if ctx.GlobalIsSet(BxAPIAuthHeaderFlag.Name) {
++		cfg.BxAPIAuthHeader = ctx.GlobalString(BxAPIAuthHeaderFlag.Name)
++
++		endpoints := SplitAndTrim(ctx.GlobalString(BxAPIEndpointsFlag.Name))
++		for _, endpoint := range endpoints {
++			if strings.HasPrefix(endpoint, "http") {
++				cfg.BxAPIEndpoints = append(cfg.BxAPIEndpoints, endpoint)
++			} else {
++				log.Error("Invalid bloXroute API endpoint, skipping", "endpoint", endpoint)
++			}
++		}
++	}
++}
++
+ // MakeDatabaseHandles raises out the number of allowed file handles per process
+ // for Geth and returns half of the allowance to assign to the database.
+ func MakeDatabaseHandles() int {
+@@ -1496,6 +1523,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
+ 	setMiner(ctx, &cfg.Miner)
+ 	setWhitelist(ctx, cfg)
+ 	setLes(ctx, cfg)
++	setBx(ctx, cfg)
+ 
+ 	// Cap the cache allowance and tune the garbage collector
+ 	mem, err := gopsutil.VirtualMemory()
+diff --git a/eth/api_backend.go b/eth/api_backend.go
+index 6577ac1e1af4..87b6e7b28d05 100644
+--- a/eth/api_backend.go
++++ b/eth/api_backend.go
+@@ -325,6 +325,14 @@ func (b *EthAPIBackend) RPCTxFeeCap() float64 {
+ 	return b.eth.config.RPCTxFeeCap
+ }
+ 
++func (b *EthAPIBackend) BxAPIEndpoints() []string {
++	return b.eth.config.BxAPIEndpoints
++}
++
++func (b *EthAPIBackend) BxAPIAuthHeader() string {
++	return b.eth.config.BxAPIAuthHeader
++}
++
+ func (b *EthAPIBackend) BloomStatus() (uint64, uint64) {
+ 	sections, _, _ := b.eth.bloomIndexer.Sections()
+ 	return params.BloomBitsBlocks, sections
+diff --git a/eth/ethconfig/config.go b/eth/ethconfig/config.go
+index 1dbd5a7f1fd8..29be1f5cf229 100644
+--- a/eth/ethconfig/config.go
++++ b/eth/ethconfig/config.go
+@@ -197,6 +197,14 @@ type Config struct {
+ 	// send-transction variants. The unit is ether.
+ 	RPCTxFeeCap float64
+ 
++	// BxAPIEndpoints is a list of blxr_tx RPC endpoints that should be forwarded to.
++	// This supports http/https endpoints.
++	BxAPIEndpoints []string
++
++	// BxAPIAuthHeader is the authentication header for submitting requests to blxr_tx.
++	// This field must be set (even "" for local gateways) for any forwarding.
++	BxAPIAuthHeader string
++
+ 	// Checkpoint is a hardcoded checkpoint which can be nil.
+ 	Checkpoint *params.TrustedCheckpoint `toml:",omitempty"`
+ 
+diff --git a/internal/ethapi/backend.go b/internal/ethapi/backend.go
+index bc60fb2a64f6..7ae10f964595 100644
+--- a/internal/ethapi/backend.go
++++ b/internal/ethapi/backend.go
+@@ -52,6 +52,8 @@ type Backend interface {
+ 	RPCEVMTimeout() time.Duration // global timeout for eth_call over rpc: DoS protection
+ 	RPCTxFeeCap() float64         // global tx fee cap for all transaction related APIs
+ 	UnprotectedAllowed() bool     // allows only for EIP155 transactions.
++	BxAPIAuthHeader() string
++	BxAPIEndpoints() []string
+ 
+ 	// Blockchain API
+ 	SetHead(number uint64)
+diff --git a/les/api_backend.go b/les/api_backend.go
+index 11a9ca128aab..c3656e42f7fc 100644
+--- a/les/api_backend.go
++++ b/les/api_backend.go
+@@ -302,6 +302,14 @@ func (b *LesApiBackend) RPCTxFeeCap() float64 {
+ 	return b.eth.config.RPCTxFeeCap
+ }
+ 
++func (b *LesApiBackend) BxAPIEndpoints() []string {
++	return []string{}
++}
++
++func (b *LesApiBackend) BxAPIAuthHeader() string {
++	return ""
++}
++
+ func (b *LesApiBackend) BloomStatus() (uint64, uint64) {
+ 	if b.eth.bloomIndexer == nil {
+ 		return 0, 0
+
+From a7225056f3b45efd66be4f860632ba2b23feca0f Mon Sep 17 00:00:00 2001
+From: Kevin Chen <kevin@bloxroute.com>
+Date: Thu, 3 Feb 2022 16:26:54 -0600
+Subject: [PATCH 2/7] setup RPC clients to work with blxr RPC
+
+---
+ cmd/bxrpc/main.go          |  0
+ cmd/utils/flags.go         | 20 ++++++++++--
+ eth/api_backend.go         | 51 ++++++++++++++++++++++++++-----
+ eth/backend.go             |  2 +-
+ eth/ethconfig/config.go    |  3 +-
+ internal/ethapi/backend.go |  2 --
+ les/api_backend.go         |  8 -----
+ rpc/client.go              | 62 ++++++++++++++++++++++++--------------
+ rpc/client_test.go         |  2 +-
+ rpc/handler.go             | 22 +++++++-------
+ rpc/http.go                | 26 ++++++++++------
+ rpc/json.go                | 42 +++++++++++++-------------
+ rpc/subscription.go        |  2 +-
+ rpc/subscription_test.go   |  2 +-
+ rpc/types.go               |  2 +-
+ rpc/websocket.go           | 27 ++++++++++++-----
+ 16 files changed, 173 insertions(+), 100 deletions(-)
+ create mode 100644 cmd/bxrpc/main.go
+
+diff --git a/cmd/bxrpc/main.go b/cmd/bxrpc/main.go
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/cmd/utils/flags.go b/cmd/utils/flags.go
+index dd0319b2d4a0..d3809329a3dc 100644
+--- a/cmd/utils/flags.go
++++ b/cmd/utils/flags.go
+@@ -19,11 +19,13 @@ package utils
+ 
+ import (
+ 	"crypto/ecdsa"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"io/ioutil"
+ 	"math"
+ 	"math/big"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
+ 	godebug "runtime/debug"
+@@ -1077,10 +1079,22 @@ func setBx(ctx *cli.Context, cfg *ethconfig.Config) {
+ 
+ 		endpoints := SplitAndTrim(ctx.GlobalString(BxAPIEndpointsFlag.Name))
+ 		for _, endpoint := range endpoints {
+-			if strings.HasPrefix(endpoint, "http") {
+-				cfg.BxAPIEndpoints = append(cfg.BxAPIEndpoints, endpoint)
++			u, err := url.Parse(endpoint)
++
++			if err == nil {
++				switch u.Scheme {
++				case "http", "https", "ws", "wss":
++				default:
++					err = errors.New("invalid endpoint scheme (http/s, and ws/s only)")
++					cfg.BxAPIEndpoints = append(cfg.BxAPIEndpoints, u)
++				}
++			}
++
++			if err != nil {
++				log.Error("Invalid bloXroute API endpoint, skipping", "endpoint", endpoint, "err", err)
++				continue
+ 			} else {
+-				log.Error("Invalid bloXroute API endpoint, skipping", "endpoint", endpoint)
++				cfg.BxAPIEndpoints = append(cfg.BxAPIEndpoints, u)
+ 			}
+ 		}
+ 	}
+diff --git a/eth/api_backend.go b/eth/api_backend.go
+index 87b6e7b28d05..3069a91eb8bc 100644
+--- a/eth/api_backend.go
++++ b/eth/api_backend.go
+@@ -18,8 +18,10 @@ package eth
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"math/big"
++	"net/http"
+ 	"time"
+ 
+ 	"github.com/ethereum/go-ethereum"
+@@ -46,6 +48,19 @@ type EthAPIBackend struct {
+ 	allowUnprotectedTxs bool
+ 	eth                 *Ethereum
+ 	gpo                 *gasprice.Oracle
++	bxClients           []*rpc.Client
++	bxAPIHeaders        http.Header
++}
++
++func NewEthAPIBackend(extRPCEnabled bool, allowUnprotectedTxs bool, eth *Ethereum, gpo *gasprice.Oracle) *EthAPIBackend {
++	contentType := "application/json"
++	headers := make(http.Header, 3)
++	headers.Set("accept", contentType)
++	headers.Set("content-type", contentType)
++	headers.Set("authorization", eth.config.BxAPIAuthHeader)
++
++	b := &EthAPIBackend{extRPCEnabled: extRPCEnabled, allowUnprotectedTxs: allowUnprotectedTxs, eth: eth, gpo: gpo, bxAPIHeaders: headers}
++	return b
+ }
+ 
+ // ChainConfig returns the active chain configuration.
+@@ -236,9 +251,37 @@ func (b *EthAPIBackend) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscri
+ }
+ 
+ func (b *EthAPIBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error {
++	// TODO: send to blxr
++
+ 	return b.eth.txPool.AddLocal(signedTx)
+ }
+ 
++func (b *EthAPIBackend) sendTxToBxAPIs(ctx context.Context, signedTx *types.Transaction) error {
++
++	for _, endpoint := range b.eth.config.BxAPIEndpoints {
++		client, err := rpc.DialHTTPWithClientHeaders(endpoint, new(http.Client), b.bxAPIHeaders)
++		if err != nil {
++			return err
++		}
++
++		result := map[string]interface{}{}
++		request := map[string]interface{}{}
++		request["transaction"] = ""
++
++		serializedRequest, err := json.Marshal(request)
++		if err != nil {
++			return err
++		}
++
++		msg := client.NewMessageWithParams("blxr_tx", serializedRequest)
++		err = client.CallContextWithMessage(ctx, &result, msg)
++		if err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
+ func (b *EthAPIBackend) GetPoolTransactions() (types.Transactions, error) {
+ 	pending := b.eth.txPool.Pending(false)
+ 	var txs types.Transactions
+@@ -325,14 +368,6 @@ func (b *EthAPIBackend) RPCTxFeeCap() float64 {
+ 	return b.eth.config.RPCTxFeeCap
+ }
+ 
+-func (b *EthAPIBackend) BxAPIEndpoints() []string {
+-	return b.eth.config.BxAPIEndpoints
+-}
+-
+-func (b *EthAPIBackend) BxAPIAuthHeader() string {
+-	return b.eth.config.BxAPIAuthHeader
+-}
+-
+ func (b *EthAPIBackend) BloomStatus() (uint64, uint64) {
+ 	sections, _, _ := b.eth.bloomIndexer.Sections()
+ 	return params.BloomBitsBlocks, sections
+diff --git a/eth/backend.go b/eth/backend.go
+index 22535e0e2289..492777f50130 100644
+--- a/eth/backend.go
++++ b/eth/backend.go
+@@ -237,7 +237,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
+ 	eth.miner = miner.New(eth, &config.Miner, chainConfig, eth.EventMux(), eth.engine, eth.isLocalBlock)
+ 	eth.miner.SetExtra(makeExtraData(config.Miner.ExtraData))
+ 
+-	eth.APIBackend = &EthAPIBackend{stack.Config().ExtRPCEnabled(), stack.Config().AllowUnprotectedTxs, eth, nil}
++	eth.APIBackend = NewEthAPIBackend(stack.Config().ExtRPCEnabled(), stack.Config().AllowUnprotectedTxs, eth, nil)
+ 	if eth.APIBackend.allowUnprotectedTxs {
+ 		log.Info("Unprotected transactions allowed")
+ 	}
+diff --git a/eth/ethconfig/config.go b/eth/ethconfig/config.go
+index 29be1f5cf229..1a52bbde131d 100644
+--- a/eth/ethconfig/config.go
++++ b/eth/ethconfig/config.go
+@@ -19,6 +19,7 @@ package ethconfig
+ 
+ import (
+ 	"math/big"
++	"net/url"
+ 	"os"
+ 	"os/user"
+ 	"path/filepath"
+@@ -199,7 +200,7 @@ type Config struct {
+ 
+ 	// BxAPIEndpoints is a list of blxr_tx RPC endpoints that should be forwarded to.
+ 	// This supports http/https endpoints.
+-	BxAPIEndpoints []string
++	BxAPIEndpoints []*url.URL
+ 
+ 	// BxAPIAuthHeader is the authentication header for submitting requests to blxr_tx.
+ 	// This field must be set (even "" for local gateways) for any forwarding.
+diff --git a/internal/ethapi/backend.go b/internal/ethapi/backend.go
+index 7ae10f964595..bc60fb2a64f6 100644
+--- a/internal/ethapi/backend.go
++++ b/internal/ethapi/backend.go
+@@ -52,8 +52,6 @@ type Backend interface {
+ 	RPCEVMTimeout() time.Duration // global timeout for eth_call over rpc: DoS protection
+ 	RPCTxFeeCap() float64         // global tx fee cap for all transaction related APIs
+ 	UnprotectedAllowed() bool     // allows only for EIP155 transactions.
+-	BxAPIAuthHeader() string
+-	BxAPIEndpoints() []string
+ 
+ 	// Blockchain API
+ 	SetHead(number uint64)
+diff --git a/les/api_backend.go b/les/api_backend.go
+index c3656e42f7fc..11a9ca128aab 100644
+--- a/les/api_backend.go
++++ b/les/api_backend.go
+@@ -302,14 +302,6 @@ func (b *LesApiBackend) RPCTxFeeCap() float64 {
+ 	return b.eth.config.RPCTxFeeCap
+ }
+ 
+-func (b *LesApiBackend) BxAPIEndpoints() []string {
+-	return []string{}
+-}
+-
+-func (b *LesApiBackend) BxAPIAuthHeader() string {
+-	return ""
+-}
+-
+ func (b *LesApiBackend) BloomStatus() (uint64, uint64) {
+ 	if b.eth.bloomIndexer == nil {
+ 		return 0, 0
+diff --git a/rpc/client.go b/rpc/client.go
+index d55af75545cd..422c6cd6f34a 100644
+--- a/rpc/client.go
++++ b/rpc/client.go
+@@ -122,18 +122,18 @@ func (cc *clientConn) close(err error, inflightReq *requestOp) {
+ }
+ 
+ type readOp struct {
+-	msgs  []*jsonrpcMessage
++	msgs  []*JSONRPCMessage
+ 	batch bool
+ }
+ 
+ type requestOp struct {
+ 	ids  []json.RawMessage
+ 	err  error
+-	resp chan *jsonrpcMessage // receives up to len(ids) responses
++	resp chan *JSONRPCMessage // receives up to len(ids) responses
+ 	sub  *ClientSubscription  // only set for EthSubscribe requests
+ }
+ 
+-func (op *requestOp) wait(ctx context.Context, c *Client) (*jsonrpcMessage, error) {
++func (op *requestOp) wait(ctx context.Context, c *Client) (*JSONRPCMessage, error) {
+ 	select {
+ 	case <-ctx.Done():
+ 		// Send the timeout to dispatch so it can remove the request IDs.
+@@ -290,14 +290,20 @@ func (c *Client) Call(result interface{}, method string, args ...interface{}) er
+ // The result must be a pointer so that package json can unmarshal into it. You
+ // can also pass nil, in which case the result is ignored.
+ func (c *Client) CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error {
+-	if result != nil && reflect.TypeOf(result).Kind() != reflect.Ptr {
+-		return fmt.Errorf("call result parameter must be pointer or nil interface: %v", result)
+-	}
+-	msg, err := c.newMessage(method, args...)
++	msg, err := c.NewMessage(method, args...)
+ 	if err != nil {
+ 		return err
+ 	}
+-	op := &requestOp{ids: []json.RawMessage{msg.ID}, resp: make(chan *jsonrpcMessage, 1)}
++	return c.CallContextWithMessage(ctx, result, msg)
++}
++
++// TODO:
++func (c *Client) CallContextWithMessage(ctx context.Context, result interface{}, msg *JSONRPCMessage) error {
++	if result != nil && reflect.TypeOf(result).Kind() != reflect.Ptr {
++		return fmt.Errorf("call result parameter must be pointer or nil interface: %v", result)
++	}
++	var err error
++	op := &requestOp{ids: []json.RawMessage{msg.ID}, resp: make(chan *JSONRPCMessage, 1)}
+ 
+ 	if c.isHTTP {
+ 		err = c.sendHTTP(ctx, op, msg)
+@@ -344,15 +350,15 @@ func (c *Client) BatchCall(b []BatchElem) error {
+ // Note that batch calls may not be executed atomically on the server side.
+ func (c *Client) BatchCallContext(ctx context.Context, b []BatchElem) error {
+ 	var (
+-		msgs = make([]*jsonrpcMessage, len(b))
++		msgs = make([]*JSONRPCMessage, len(b))
+ 		byID = make(map[string]int, len(b))
+ 	)
+ 	op := &requestOp{
+ 		ids:  make([]json.RawMessage, len(b)),
+-		resp: make(chan *jsonrpcMessage, len(b)),
++		resp: make(chan *JSONRPCMessage, len(b)),
+ 	}
+ 	for i, elem := range b {
+-		msg, err := c.newMessage(elem.Method, elem.Args...)
++		msg, err := c.NewMessage(elem.Method, elem.Args...)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -370,7 +376,7 @@ func (c *Client) BatchCallContext(ctx context.Context, b []BatchElem) error {
+ 
+ 	// Wait for all responses to come back.
+ 	for n := 0; n < len(b) && err == nil; n++ {
+-		var resp *jsonrpcMessage
++		var resp *JSONRPCMessage
+ 		resp, err = op.wait(ctx, c)
+ 		if err != nil {
+ 			break
+@@ -395,7 +401,7 @@ func (c *Client) BatchCallContext(ctx context.Context, b []BatchElem) error {
+ // Notify sends a notification, i.e. a method call that doesn't expect a response.
+ func (c *Client) Notify(ctx context.Context, method string, args ...interface{}) error {
+ 	op := new(requestOp)
+-	msg, err := c.newMessage(method, args...)
++	msg, err := c.NewMessage(method, args...)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -443,13 +449,13 @@ func (c *Client) Subscribe(ctx context.Context, namespace string, channel interf
+ 		return nil, ErrNotificationsUnsupported
+ 	}
+ 
+-	msg, err := c.newMessage(namespace+subscribeMethodSuffix, args...)
++	msg, err := c.NewMessage(namespace+subscribeMethodSuffix, args...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	op := &requestOp{
+ 		ids:  []json.RawMessage{msg.ID},
+-		resp: make(chan *jsonrpcMessage),
++		resp: make(chan *JSONRPCMessage),
+ 		sub:  newClientSubscription(c, namespace, chanVal),
+ 	}
+ 
+@@ -464,15 +470,25 @@ func (c *Client) Subscribe(ctx context.Context, namespace string, channel interf
+ 	return op.sub, nil
+ }
+ 
+-func (c *Client) newMessage(method string, paramsIn ...interface{}) (*jsonrpcMessage, error) {
+-	msg := &jsonrpcMessage{Version: vsn, ID: c.nextID(), Method: method}
+-	if paramsIn != nil { // prevent sending "params":null
+-		var err error
+-		if msg.Params, err = json.Marshal(paramsIn); err != nil {
+-			return nil, err
+-		}
++func (c *Client) NewMessage(method string, paramsIn ...interface{}) (*JSONRPCMessage, error) {
++	var (
++		params json.RawMessage
++		err    error
++	)
++
++	if params, err = json.Marshal(paramsIn); err != nil {
++		return nil, err
++	}
++
++	return c.NewMessageWithParams(method, params), nil
++}
++
++func (c *Client) NewMessageWithParams(method string, params json.RawMessage) *JSONRPCMessage {
++	msg := &JSONRPCMessage{Version: vsn, ID: c.nextID(), Method: method}
++	if params != nil { // prevent sending "params":null
++		msg.Params = params
+ 	}
+-	return msg, nil
++	return msg
+ }
+ 
+ // send registers op with the dispatch loop, then sends msg on the connection.
+diff --git a/rpc/client_test.go b/rpc/client_test.go
+index fa6010bb199c..2c3012392f5a 100644
+--- a/rpc/client_test.go
++++ b/rpc/client_test.go
+@@ -383,7 +383,7 @@ type unsubscribeRecorder struct {
+ 	unsubscribes map[string]bool
+ }
+ 
+-func (r *unsubscribeRecorder) readBatch() ([]*jsonrpcMessage, bool, error) {
++func (r *unsubscribeRecorder) readBatch() ([]*JSONRPCMessage, bool, error) {
+ 	if r.unsubscribes == nil {
+ 		r.unsubscribes = make(map[string]bool)
+ 	}
+diff --git a/rpc/handler.go b/rpc/handler.go
+index 488a29300a10..e04b378f5287 100644
+--- a/rpc/handler.go
++++ b/rpc/handler.go
+@@ -93,7 +93,7 @@ func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *
+ }
+ 
+ // handleBatch executes all messages in a batch and returns the responses.
+-func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
++func (h *handler) handleBatch(msgs []*JSONRPCMessage) {
+ 	// Emit error response for empty batches:
+ 	if len(msgs) == 0 {
+ 		h.startCallProc(func(cp *callProc) {
+@@ -103,7 +103,7 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
+ 	}
+ 
+ 	// Handle non-call messages first:
+-	calls := make([]*jsonrpcMessage, 0, len(msgs))
++	calls := make([]*JSONRPCMessage, 0, len(msgs))
+ 	for _, msg := range msgs {
+ 		if handled := h.handleImmediate(msg); !handled {
+ 			calls = append(calls, msg)
+@@ -114,7 +114,7 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
+ 	}
+ 	// Process calls on a goroutine because they may block indefinitely:
+ 	h.startCallProc(func(cp *callProc) {
+-		answers := make([]*jsonrpcMessage, 0, len(msgs))
++		answers := make([]*JSONRPCMessage, 0, len(msgs))
+ 		for _, msg := range calls {
+ 			if answer := h.handleCallMsg(cp, msg); answer != nil {
+ 				answers = append(answers, answer)
+@@ -131,7 +131,7 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
+ }
+ 
+ // handleMsg handles a single message.
+-func (h *handler) handleMsg(msg *jsonrpcMessage) {
++func (h *handler) handleMsg(msg *JSONRPCMessage) {
+ 	if ok := h.handleImmediate(msg); ok {
+ 		return
+ 	}
+@@ -229,7 +229,7 @@ func (h *handler) startCallProc(fn func(*callProc)) {
+ 
+ // handleImmediate executes non-call messages. It returns false if the message is a
+ // call or requires a reply.
+-func (h *handler) handleImmediate(msg *jsonrpcMessage) bool {
++func (h *handler) handleImmediate(msg *JSONRPCMessage) bool {
+ 	start := time.Now()
+ 	switch {
+ 	case msg.isNotification():
+@@ -248,7 +248,7 @@ func (h *handler) handleImmediate(msg *jsonrpcMessage) bool {
+ }
+ 
+ // handleSubscriptionResult processes subscription notifications.
+-func (h *handler) handleSubscriptionResult(msg *jsonrpcMessage) {
++func (h *handler) handleSubscriptionResult(msg *JSONRPCMessage) {
+ 	var result subscriptionResult
+ 	if err := json.Unmarshal(msg.Params, &result); err != nil {
+ 		h.log.Debug("Dropping invalid subscription message")
+@@ -260,7 +260,7 @@ func (h *handler) handleSubscriptionResult(msg *jsonrpcMessage) {
+ }
+ 
+ // handleResponse processes method call responses.
+-func (h *handler) handleResponse(msg *jsonrpcMessage) {
++func (h *handler) handleResponse(msg *JSONRPCMessage) {
+ 	op := h.respWait[string(msg.ID)]
+ 	if op == nil {
+ 		h.log.Debug("Unsolicited RPC response", "reqid", idForLog{msg.ID})
+@@ -287,7 +287,7 @@ func (h *handler) handleResponse(msg *jsonrpcMessage) {
+ }
+ 
+ // handleCallMsg executes a call message and returns the answer.
+-func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
++func (h *handler) handleCallMsg(ctx *callProc, msg *JSONRPCMessage) *JSONRPCMessage {
+ 	start := time.Now()
+ 	switch {
+ 	case msg.isNotification():
+@@ -316,7 +316,7 @@ func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage) *jsonrpcMess
+ }
+ 
+ // handleCall processes method calls.
+-func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
++func (h *handler) handleCall(cp *callProc, msg *JSONRPCMessage) *JSONRPCMessage {
+ 	if msg.isSubscribe() {
+ 		return h.handleSubscribe(cp, msg)
+ 	}
+@@ -352,7 +352,7 @@ func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage
+ }
+ 
+ // handleSubscribe processes *_subscribe method calls.
+-func (h *handler) handleSubscribe(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
++func (h *handler) handleSubscribe(cp *callProc, msg *JSONRPCMessage) *JSONRPCMessage {
+ 	if !h.allowSubscribe {
+ 		return msg.errorResponse(ErrNotificationsUnsupported)
+ 	}
+@@ -385,7 +385,7 @@ func (h *handler) handleSubscribe(cp *callProc, msg *jsonrpcMessage) *jsonrpcMes
+ }
+ 
+ // runMethod runs the Go callback for an RPC method.
+-func (h *handler) runMethod(ctx context.Context, msg *jsonrpcMessage, callb *callback, args []reflect.Value) *jsonrpcMessage {
++func (h *handler) runMethod(ctx context.Context, msg *JSONRPCMessage, callb *callback, args []reflect.Value) *JSONRPCMessage {
+ 	result, err := callb.call(ctx, msg.Method, args)
+ 	if err != nil {
+ 		return msg.errorResponse(err)
+diff --git a/rpc/http.go b/rpc/http.go
+index 18404c060a86..3de41acf7126 100644
+--- a/rpc/http.go
++++ b/rpc/http.go
+@@ -64,7 +64,7 @@ func (hc *httpConn) remoteAddr() string {
+ 	return hc.url
+ }
+ 
+-func (hc *httpConn) readBatch() ([]*jsonrpcMessage, bool, error) {
++func (hc *httpConn) readBatch() ([]*JSONRPCMessage, bool, error) {
+ 	<-hc.closeCh
+ 	return nil, false, io.EOF
+ }
+@@ -109,9 +109,9 @@ var DefaultHTTPTimeouts = HTTPTimeouts{
+ 	IdleTimeout:  120 * time.Second,
+ }
+ 
+-// DialHTTPWithClient creates a new RPC client that connects to an RPC server over HTTP
+-// using the provided HTTP Client.
+-func DialHTTPWithClient(endpoint string, client *http.Client) (*Client, error) {
++// DialHTTPWithClientHeaders create a new RPC client that connects to an RPC server over HTTP
++// using the provided HTTP Client and Headers.
++func DialHTTPWithClientHeaders(endpoint string, client *http.Client, headers http.Header) (*Client, error) {
+ 	// Sanity check URL so we don't end up with a client that will fail every request.
+ 	_, err := url.Parse(endpoint)
+ 	if err != nil {
+@@ -119,9 +119,6 @@ func DialHTTPWithClient(endpoint string, client *http.Client) (*Client, error) {
+ 	}
+ 
+ 	initctx := context.Background()
+-	headers := make(http.Header, 2)
+-	headers.Set("accept", contentType)
+-	headers.Set("content-type", contentType)
+ 	return newClient(initctx, func(context.Context) (ServerCodec, error) {
+ 		hc := &httpConn{
+ 			client:  client,
+@@ -133,6 +130,15 @@ func DialHTTPWithClient(endpoint string, client *http.Client) (*Client, error) {
+ 	})
+ }
+ 
++// DialHTTPWithClient creates a new RPC client that connects to an RPC server over HTTP
++// using the provided HTTP Client.
++func DialHTTPWithClient(endpoint string, client *http.Client) (*Client, error) {
++	headers := make(http.Header, 2)
++	headers.Set("accept", contentType)
++	headers.Set("content-type", contentType)
++	return DialHTTPWithClientHeaders(endpoint, client, headers)
++}
++
+ // DialHTTP creates a new RPC client that connects to an RPC server over HTTP.
+ func DialHTTP(endpoint string) (*Client, error) {
+ 	return DialHTTPWithClient(endpoint, new(http.Client))
+@@ -146,7 +152,7 @@ func (c *Client) sendHTTP(ctx context.Context, op *requestOp, msg interface{}) e
+ 	}
+ 	defer respBody.Close()
+ 
+-	var respmsg jsonrpcMessage
++	var respmsg JSONRPCMessage
+ 	if err := json.NewDecoder(respBody).Decode(&respmsg); err != nil {
+ 		return err
+ 	}
+@@ -154,14 +160,14 @@ func (c *Client) sendHTTP(ctx context.Context, op *requestOp, msg interface{}) e
+ 	return nil
+ }
+ 
+-func (c *Client) sendBatchHTTP(ctx context.Context, op *requestOp, msgs []*jsonrpcMessage) error {
++func (c *Client) sendBatchHTTP(ctx context.Context, op *requestOp, msgs []*JSONRPCMessage) error {
+ 	hc := c.writeConn.(*httpConn)
+ 	respBody, err := hc.doRequest(ctx, msgs)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer respBody.Close()
+-	var respmsgs []jsonrpcMessage
++	var respmsgs []JSONRPCMessage
+ 	if err := json.NewDecoder(respBody).Decode(&respmsgs); err != nil {
+ 		return err
+ 	}
+diff --git a/rpc/json.go b/rpc/json.go
+index 6024f1e7dc9b..ad4d63ad7ab2 100644
+--- a/rpc/json.go
++++ b/rpc/json.go
+@@ -48,7 +48,7 @@ type subscriptionResult struct {
+ 
+ // A value of this type can a JSON-RPC request, notification, successful response or
+ // error response. Which one it is depends on the fields.
+-type jsonrpcMessage struct {
++type JSONRPCMessage struct {
+ 	Version string          `json:"jsonrpc,omitempty"`
+ 	ID      json.RawMessage `json:"id,omitempty"`
+ 	Method  string          `json:"method,omitempty"`
+@@ -57,57 +57,57 @@ type jsonrpcMessage struct {
+ 	Result  json.RawMessage `json:"result,omitempty"`
+ }
+ 
+-func (msg *jsonrpcMessage) isNotification() bool {
++func (msg *JSONRPCMessage) isNotification() bool {
+ 	return msg.ID == nil && msg.Method != ""
+ }
+ 
+-func (msg *jsonrpcMessage) isCall() bool {
++func (msg *JSONRPCMessage) isCall() bool {
+ 	return msg.hasValidID() && msg.Method != ""
+ }
+ 
+-func (msg *jsonrpcMessage) isResponse() bool {
++func (msg *JSONRPCMessage) isResponse() bool {
+ 	return msg.hasValidID() && msg.Method == "" && msg.Params == nil && (msg.Result != nil || msg.Error != nil)
+ }
+ 
+-func (msg *jsonrpcMessage) hasValidID() bool {
++func (msg *JSONRPCMessage) hasValidID() bool {
+ 	return len(msg.ID) > 0 && msg.ID[0] != '{' && msg.ID[0] != '['
+ }
+ 
+-func (msg *jsonrpcMessage) isSubscribe() bool {
++func (msg *JSONRPCMessage) isSubscribe() bool {
+ 	return strings.HasSuffix(msg.Method, subscribeMethodSuffix)
+ }
+ 
+-func (msg *jsonrpcMessage) isUnsubscribe() bool {
++func (msg *JSONRPCMessage) isUnsubscribe() bool {
+ 	return strings.HasSuffix(msg.Method, unsubscribeMethodSuffix)
+ }
+ 
+-func (msg *jsonrpcMessage) namespace() string {
++func (msg *JSONRPCMessage) namespace() string {
+ 	elem := strings.SplitN(msg.Method, serviceMethodSeparator, 2)
+ 	return elem[0]
+ }
+ 
+-func (msg *jsonrpcMessage) String() string {
++func (msg *JSONRPCMessage) String() string {
+ 	b, _ := json.Marshal(msg)
+ 	return string(b)
+ }
+ 
+-func (msg *jsonrpcMessage) errorResponse(err error) *jsonrpcMessage {
++func (msg *JSONRPCMessage) errorResponse(err error) *JSONRPCMessage {
+ 	resp := errorMessage(err)
+ 	resp.ID = msg.ID
+ 	return resp
+ }
+ 
+-func (msg *jsonrpcMessage) response(result interface{}) *jsonrpcMessage {
++func (msg *JSONRPCMessage) response(result interface{}) *JSONRPCMessage {
+ 	enc, err := json.Marshal(result)
+ 	if err != nil {
+ 		// TODO: wrap with 'internal server error'
+ 		return msg.errorResponse(err)
+ 	}
+-	return &jsonrpcMessage{Version: vsn, ID: msg.ID, Result: enc}
++	return &JSONRPCMessage{Version: vsn, ID: msg.ID, Result: enc}
+ }
+ 
+-func errorMessage(err error) *jsonrpcMessage {
+-	msg := &jsonrpcMessage{Version: vsn, ID: null, Error: &jsonError{
++func errorMessage(err error) *JSONRPCMessage {
++	msg := &JSONRPCMessage{Version: vsn, ID: null, Error: &jsonError{
+ 		Code:    defaultErrorCode,
+ 		Message: err.Error(),
+ 	}}
+@@ -207,7 +207,7 @@ func (c *jsonCodec) remoteAddr() string {
+ 	return c.remote
+ }
+ 
+-func (c *jsonCodec) readBatch() (messages []*jsonrpcMessage, batch bool, err error) {
++func (c *jsonCodec) readBatch() (messages []*JSONRPCMessage, batch bool, err error) {
+ 	// Decode the next JSON object in the input stream.
+ 	// This verifies basic syntax, etc.
+ 	var rawmsg json.RawMessage
+@@ -219,7 +219,7 @@ func (c *jsonCodec) readBatch() (messages []*jsonrpcMessage, batch bool, err err
+ 		if msg == nil {
+ 			// Message is JSON 'null'. Replace with zero value so it
+ 			// will be treated like any other invalid message.
+-			messages[i] = new(jsonrpcMessage)
++			messages[i] = new(JSONRPCMessage)
+ 		}
+ 	}
+ 	return messages, batch, nil
+@@ -252,18 +252,18 @@ func (c *jsonCodec) closed() <-chan interface{} {
+ // parseMessage parses raw bytes as a (batch of) JSON-RPC message(s). There are no error
+ // checks in this function because the raw message has already been syntax-checked when it
+ // is called. Any non-JSON-RPC messages in the input return the zero value of
+-// jsonrpcMessage.
+-func parseMessage(raw json.RawMessage) ([]*jsonrpcMessage, bool) {
++// JSONRPCMessage.
++func parseMessage(raw json.RawMessage) ([]*JSONRPCMessage, bool) {
+ 	if !isBatch(raw) {
+-		msgs := []*jsonrpcMessage{{}}
++		msgs := []*JSONRPCMessage{{}}
+ 		json.Unmarshal(raw, &msgs[0])
+ 		return msgs, false
+ 	}
+ 	dec := json.NewDecoder(bytes.NewReader(raw))
+ 	dec.Token() // skip '['
+-	var msgs []*jsonrpcMessage
++	var msgs []*JSONRPCMessage
+ 	for dec.More() {
+-		msgs = append(msgs, new(jsonrpcMessage))
++		msgs = append(msgs, new(JSONRPCMessage))
+ 		dec.Decode(&msgs[len(msgs)-1])
+ 	}
+ 	return msgs, true
+diff --git a/rpc/subscription.go b/rpc/subscription.go
+index 942e764e5d6c..c6e8424b9df4 100644
+--- a/rpc/subscription.go
++++ b/rpc/subscription.go
+@@ -175,7 +175,7 @@ func (n *Notifier) activate() error {
+ func (n *Notifier) send(sub *Subscription, data json.RawMessage) error {
+ 	params, _ := json.Marshal(&subscriptionResult{ID: string(sub.ID), Result: data})
+ 	ctx := context.Background()
+-	return n.h.conn.writeJSON(ctx, &jsonrpcMessage{
++	return n.h.conn.writeJSON(ctx, &JSONRPCMessage{
+ 		Version: vsn,
+ 		Method:  n.namespace + notificationMethodSuffix,
+ 		Params:  params,
+diff --git a/rpc/subscription_test.go b/rpc/subscription_test.go
+index 54a053dba805..264556cfe8c0 100644
+--- a/rpc/subscription_test.go
++++ b/rpc/subscription_test.go
+@@ -193,7 +193,7 @@ func waitForMessages(in *json.Decoder, successes chan subConfirmation, notificat
+ }
+ 
+ func readAndValidateMessage(in *json.Decoder) (*subConfirmation, *subscriptionResult, error) {
+-	var msg jsonrpcMessage
++	var msg JSONRPCMessage
+ 	if err := in.Decode(&msg); err != nil {
+ 		return nil, nil, fmt.Errorf("decode error: %v", err)
+ 	}
+diff --git a/rpc/types.go b/rpc/types.go
+index 959e383723bd..43de6069c083 100644
+--- a/rpc/types.go
++++ b/rpc/types.go
+@@ -41,7 +41,7 @@ type API struct {
+ // multiple go-routines concurrently.
+ type ServerCodec interface {
+ 	peerInfo() PeerInfo
+-	readBatch() (msgs []*jsonrpcMessage, isBatch bool, err error)
++	readBatch() (msgs []*JSONRPCMessage, isBatch bool, err error)
+ 	close()
+ 
+ 	jsonWriter
+diff --git a/rpc/websocket.go b/rpc/websocket.go
+index 28380d8aa4ae..2004e4504d5f 100644
+--- a/rpc/websocket.go
++++ b/rpc/websocket.go
+@@ -181,15 +181,13 @@ func parseOriginURL(origin string) (string, string, string, error) {
+ 	return scheme, hostname, port, nil
+ }
+ 
+-// DialWebsocketWithDialer creates a new RPC client that communicates with a JSON-RPC server
+-// that is listening on the given endpoint using the provided dialer.
+-func DialWebsocketWithDialer(ctx context.Context, endpoint, origin string, dialer websocket.Dialer) (*Client, error) {
+-	endpoint, header, err := wsClientHeaders(endpoint, origin)
++func DialWebsocketWithDialerHeaders(ctx context.Context, endpoint, origin string, dialer websocket.Dialer, headers http.Header) (*Client, error) {
++	endpoint, _, err := wsClientHeaders(endpoint, origin)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	return newClient(ctx, func(ctx context.Context) (ServerCodec, error) {
+-		conn, resp, err := dialer.DialContext(ctx, endpoint, header)
++		conn, resp, err := dialer.DialContext(ctx, endpoint, headers)
+ 		if err != nil {
+ 			hErr := wsHandshakeError{err: err}
+ 			if resp != nil {
+@@ -197,22 +195,35 @@ func DialWebsocketWithDialer(ctx context.Context, endpoint, origin string, diale
+ 			}
+ 			return nil, hErr
+ 		}
+-		return newWebsocketCodec(conn, endpoint, header), nil
++		return newWebsocketCodec(conn, endpoint, headers), nil
+ 	})
+ }
+ 
++// DialWebsocketWithDialer creates a new RPC client that communicates with a JSON-RPC server
++// that is listening on the given endpoint using the provided dialer.
++func DialWebsocketWithDialer(ctx context.Context, endpoint, origin string, dialer websocket.Dialer) (*Client, error) {
++	endpoint, header, err := wsClientHeaders(endpoint, origin)
++	if err != nil {
++		return nil, err
++	}
++	return DialWebsocketWithDialerHeaders(ctx, endpoint, origin, dialer, header)
++}
++
+ // DialWebsocket creates a new RPC client that communicates with a JSON-RPC server
+ // that is listening on the given endpoint.
+ //
+ // The context is used for the initial connection establishment. It does not
+ // affect subsequent interactions with the client.
+ func DialWebsocket(ctx context.Context, endpoint, origin string) (*Client, error) {
+-	dialer := websocket.Dialer{
++	return DialWebsocketWithDialer(ctx, endpoint, origin, WebsocketDialer())
++}
++
++func WebsocketDialer() websocket.Dialer {
++	return websocket.Dialer{
+ 		ReadBufferSize:  wsReadBuffer,
+ 		WriteBufferSize: wsWriteBuffer,
+ 		WriteBufferPool: wsBufferPool,
+ 	}
+-	return DialWebsocketWithDialer(ctx, endpoint, origin, dialer)
+ }
+ 
+ func wsClientHeaders(endpoint, origin string) (string, http.Header, error) {
+
+From 694888e5c0132fde5bb8b1cfa9b2a34c736d8777 Mon Sep 17 00:00:00 2001
+From: Kevin Chen <kevin@bloxroute.com>
+Date: Fri, 4 Feb 2022 14:53:47 -0600
+Subject: [PATCH 3/7] send tx to bloxroute APIs as well
+
+---
+ eth/api_backend.go | 69 ++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 48 insertions(+), 21 deletions(-)
+
+diff --git a/eth/api_backend.go b/eth/api_backend.go
+index 3069a91eb8bc..9efe244179c9 100644
+--- a/eth/api_backend.go
++++ b/eth/api_backend.go
+@@ -20,6 +20,8 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
++	"github.com/ethereum/go-ethereum/common/hexutil"
++	"github.com/ethereum/go-ethereum/log"
+ 	"math/big"
+ 	"net/http"
+ 	"time"
+@@ -49,17 +51,41 @@ type EthAPIBackend struct {
+ 	eth                 *Ethereum
+ 	gpo                 *gasprice.Oracle
+ 	bxClients           []*rpc.Client
+-	bxAPIHeaders        http.Header
+ }
+ 
+ func NewEthAPIBackend(extRPCEnabled bool, allowUnprotectedTxs bool, eth *Ethereum, gpo *gasprice.Oracle) *EthAPIBackend {
+-	contentType := "application/json"
+-	headers := make(http.Header, 3)
+-	headers.Set("accept", contentType)
+-	headers.Set("content-type", contentType)
+-	headers.Set("authorization", eth.config.BxAPIAuthHeader)
+-
+-	b := &EthAPIBackend{extRPCEnabled: extRPCEnabled, allowUnprotectedTxs: allowUnprotectedTxs, eth: eth, gpo: gpo, bxAPIHeaders: headers}
++	b := &EthAPIBackend{extRPCEnabled: extRPCEnabled, allowUnprotectedTxs: allowUnprotectedTxs, eth: eth, gpo: gpo}
++
++	if eth.config.BxAPIAuthHeader != "" {
++		contentType := "application/json"
++		httpHeaders := make(http.Header, 3)
++		httpHeaders.Set("accept", contentType)
++		httpHeaders.Set("content-type", contentType)
++		httpHeaders.Set("authorization", eth.config.BxAPIAuthHeader)
++
++		wsHeaders := make(http.Header, 1)
++		wsHeaders.Set("authorization", eth.config.BxAPIAuthHeader)
++
++		for _, url := range eth.config.BxAPIEndpoints {
++			var (
++				client *rpc.Client
++				err    error
++			)
++			switch url.Scheme {
++			case "http", "https":
++				client, err = rpc.DialHTTPWithClientHeaders(url.String(), new(http.Client), httpHeaders)
++			case "ws", "wss":
++				client, err = rpc.DialWebsocketWithDialerHeaders(context.Background(), url.String(), "", rpc.WebsocketDialer(), wsHeaders)
++			default:
++				err = errors.New("unknown URL scheme")
++			}
++			if err != nil {
++				b.bxClients = append(b.bxClients, client)
++			} else {
++				log.Error("could not create bloXroute API client", "url", url, "err", err)
++			}
++		}
++	}
+ 	return b
+ }
+ 
+@@ -251,35 +277,36 @@ func (b *EthAPIBackend) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscri
+ }
+ 
+ func (b *EthAPIBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error {
+-	// TODO: send to blxr
+-
++	go b.sendTxToBxAPIs(ctx, signedTx)
+ 	return b.eth.txPool.AddLocal(signedTx)
+ }
+ 
+-func (b *EthAPIBackend) sendTxToBxAPIs(ctx context.Context, signedTx *types.Transaction) error {
++func (b *EthAPIBackend) sendTxToBxAPIs(ctx context.Context, signedTx *types.Transaction) {
++	txBytes, err := signedTx.MarshalBinary()
++	if err != nil {
++		log.Error("could not serialize transaction for sending to bloXroute API", "err", err)
++		return
++	}
+ 
+-	for _, endpoint := range b.eth.config.BxAPIEndpoints {
+-		client, err := rpc.DialHTTPWithClientHeaders(endpoint, new(http.Client), b.bxAPIHeaders)
+-		if err != nil {
+-			return err
+-		}
++	request := map[string]interface{}{}
++	request["transaction"] = hexutil.Encode(txBytes)
+ 
++	for _, client := range b.bxClients {
+ 		result := map[string]interface{}{}
+-		request := map[string]interface{}{}
+-		request["transaction"] = ""
+ 
+ 		serializedRequest, err := json.Marshal(request)
+ 		if err != nil {
+-			return err
++			log.Error("could not serialize transaction for sending to bloXroute API", "err", err)
++			continue
+ 		}
+ 
+ 		msg := client.NewMessageWithParams("blxr_tx", serializedRequest)
+ 		err = client.CallContextWithMessage(ctx, &result, msg)
+ 		if err != nil {
+-			return err
++			log.Error("sending transaction to bloXroute API failed", "err", err)
++			continue
+ 		}
+ 	}
+-	return nil
+ }
+ 
+ func (b *EthAPIBackend) GetPoolTransactions() (types.Transactions, error) {
+
+From 5bea18bc18801132d89059d8790df9a196377fa2 Mon Sep 17 00:00:00 2001
+From: Kevin Chen <kevin@bloxroute.com>
+Date: Wed, 9 Feb 2022 16:50:06 -0600
+Subject: [PATCH 4/7] Clean it all up, docstrings, etc
+
+---
+ cmd/bxrpc/main.go  |   0
+ cmd/utils/flags.go |   1 -
+ eth/api_backend.go |  70 ++----------------------------
+ eth/bxapi.go       | 104 +++++++++++++++++++++++++++++++++++++++++++++
+ rpc/client.go      |  10 ++++-
+ rpc/websocket.go   |   1 +
+ 6 files changed, 117 insertions(+), 69 deletions(-)
+ delete mode 100644 cmd/bxrpc/main.go
+ create mode 100644 eth/bxapi.go
+
+diff --git a/cmd/bxrpc/main.go b/cmd/bxrpc/main.go
+deleted file mode 100644
+index e69de29bb2d1..000000000000
+diff --git a/cmd/utils/flags.go b/cmd/utils/flags.go
+index d3809329a3dc..70013c278f1d 100644
+--- a/cmd/utils/flags.go
++++ b/cmd/utils/flags.go
+@@ -1086,7 +1086,6 @@ func setBx(ctx *cli.Context, cfg *ethconfig.Config) {
+ 				case "http", "https", "ws", "wss":
+ 				default:
+ 					err = errors.New("invalid endpoint scheme (http/s, and ws/s only)")
+-					cfg.BxAPIEndpoints = append(cfg.BxAPIEndpoints, u)
+ 				}
+ 			}
+ 
+diff --git a/eth/api_backend.go b/eth/api_backend.go
+index 9efe244179c9..fd558f5bc6c5 100644
+--- a/eth/api_backend.go
++++ b/eth/api_backend.go
+@@ -18,12 +18,8 @@ package eth
+ 
+ import (
+ 	"context"
+-	"encoding/json"
+ 	"errors"
+-	"github.com/ethereum/go-ethereum/common/hexutil"
+-	"github.com/ethereum/go-ethereum/log"
+ 	"math/big"
+-	"net/http"
+ 	"time"
+ 
+ 	"github.com/ethereum/go-ethereum"
+@@ -50,43 +46,11 @@ type EthAPIBackend struct {
+ 	allowUnprotectedTxs bool
+ 	eth                 *Ethereum
+ 	gpo                 *gasprice.Oracle
+-	bxClients           []*rpc.Client
++	bxClients           BxAPIClients
+ }
+ 
+ func NewEthAPIBackend(extRPCEnabled bool, allowUnprotectedTxs bool, eth *Ethereum, gpo *gasprice.Oracle) *EthAPIBackend {
+-	b := &EthAPIBackend{extRPCEnabled: extRPCEnabled, allowUnprotectedTxs: allowUnprotectedTxs, eth: eth, gpo: gpo}
+-
+-	if eth.config.BxAPIAuthHeader != "" {
+-		contentType := "application/json"
+-		httpHeaders := make(http.Header, 3)
+-		httpHeaders.Set("accept", contentType)
+-		httpHeaders.Set("content-type", contentType)
+-		httpHeaders.Set("authorization", eth.config.BxAPIAuthHeader)
+-
+-		wsHeaders := make(http.Header, 1)
+-		wsHeaders.Set("authorization", eth.config.BxAPIAuthHeader)
+-
+-		for _, url := range eth.config.BxAPIEndpoints {
+-			var (
+-				client *rpc.Client
+-				err    error
+-			)
+-			switch url.Scheme {
+-			case "http", "https":
+-				client, err = rpc.DialHTTPWithClientHeaders(url.String(), new(http.Client), httpHeaders)
+-			case "ws", "wss":
+-				client, err = rpc.DialWebsocketWithDialerHeaders(context.Background(), url.String(), "", rpc.WebsocketDialer(), wsHeaders)
+-			default:
+-				err = errors.New("unknown URL scheme")
+-			}
+-			if err != nil {
+-				b.bxClients = append(b.bxClients, client)
+-			} else {
+-				log.Error("could not create bloXroute API client", "url", url, "err", err)
+-			}
+-		}
+-	}
+-	return b
++	return &EthAPIBackend{extRPCEnabled: extRPCEnabled, allowUnprotectedTxs: allowUnprotectedTxs, eth: eth, gpo: gpo, bxClients: NewBxAPIClients(eth.config)}
+ }
+ 
+ // ChainConfig returns the active chain configuration.
+@@ -277,38 +241,10 @@ func (b *EthAPIBackend) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscri
+ }
+ 
+ func (b *EthAPIBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error {
+-	go b.sendTxToBxAPIs(ctx, signedTx)
++	b.bxClients.SubmitTx(ctx, signedTx)
+ 	return b.eth.txPool.AddLocal(signedTx)
+ }
+ 
+-func (b *EthAPIBackend) sendTxToBxAPIs(ctx context.Context, signedTx *types.Transaction) {
+-	txBytes, err := signedTx.MarshalBinary()
+-	if err != nil {
+-		log.Error("could not serialize transaction for sending to bloXroute API", "err", err)
+-		return
+-	}
+-
+-	request := map[string]interface{}{}
+-	request["transaction"] = hexutil.Encode(txBytes)
+-
+-	for _, client := range b.bxClients {
+-		result := map[string]interface{}{}
+-
+-		serializedRequest, err := json.Marshal(request)
+-		if err != nil {
+-			log.Error("could not serialize transaction for sending to bloXroute API", "err", err)
+-			continue
+-		}
+-
+-		msg := client.NewMessageWithParams("blxr_tx", serializedRequest)
+-		err = client.CallContextWithMessage(ctx, &result, msg)
+-		if err != nil {
+-			log.Error("sending transaction to bloXroute API failed", "err", err)
+-			continue
+-		}
+-	}
+-}
+-
+ func (b *EthAPIBackend) GetPoolTransactions() (types.Transactions, error) {
+ 	pending := b.eth.txPool.Pending(false)
+ 	var txs types.Transactions
+diff --git a/eth/bxapi.go b/eth/bxapi.go
+new file mode 100644
+index 000000000000..0230493feb79
+--- /dev/null
++++ b/eth/bxapi.go
+@@ -0,0 +1,104 @@
++package eth
++
++import (
++	"context"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"github.com/ethereum/go-ethereum/core/types"
++	"github.com/ethereum/go-ethereum/eth/ethconfig"
++	"github.com/ethereum/go-ethereum/log"
++	"github.com/ethereum/go-ethereum/rpc"
++	"net/http"
++	"net/url"
++)
++
++type BxAPIClients []BxAPIClient
++
++type BxAPIClient struct {
++	*rpc.Client
++	endpoint *url.URL
++}
++
++func NewBxAPIClients(config *ethconfig.Config) BxAPIClients {
++	clients := make(BxAPIClients, 0)
++
++	if config.BxAPIAuthHeader == "" {
++		return clients
++	}
++
++	contentType := "application/json"
++	httpHeaders := make(http.Header, 3)
++	httpHeaders.Set("accept", contentType)
++	httpHeaders.Set("content-type", contentType)
++	httpHeaders.Set("authorization", config.BxAPIAuthHeader)
++
++	wsHeaders := make(http.Header, 1)
++	wsHeaders.Set("authorization", config.BxAPIAuthHeader)
++
++	for _, endpoint := range config.BxAPIEndpoints {
++		var (
++			client *rpc.Client
++			err    error
++		)
++		switch endpoint.Scheme {
++		case "http", "https":
++			client, err = rpc.DialHTTPWithClientHeaders(endpoint.String(), new(http.Client), httpHeaders)
++		case "ws", "wss":
++			client, err = rpc.DialWebsocketWithDialerHeaders(context.Background(), endpoint.String(), "", rpc.WebsocketDialer(), wsHeaders)
++		default:
++			err = errors.New("unknown URL scheme")
++		}
++		if err == nil {
++			clients = append(clients, BxAPIClient{client, endpoint})
++			log.Info("Registered bloXroute API client", "endpoint", endpoint)
++		} else {
++			log.Error("Failed registering bloXroute API client", "endpoint", endpoint, "err", err)
++		}
++	}
++
++	return clients
++}
++
++func (b BxAPIClients) SubmitTx(ctx context.Context, tx *types.Transaction) {
++	go func() {
++		txHash := tx.Hash().String()
++		txBytes, err := tx.MarshalBinary()
++		if err != nil {
++			log.Error("Failed serializing transaction for sending to bloXroute API", "err", err, "hash", txHash)
++			return
++		}
++
++		request := blxrTxRequest{
++			Transaction: hex.EncodeToString(txBytes),
++		}
++		serializedRequest, err := json.Marshal(request)
++		if err != nil {
++			log.Error("Failed serializing transaction for sending to bloXroute API", "err", err, "hash", txHash)
++		}
++
++		for _, client := range b {
++			var result blxrTxResponse
++			msg := client.NewMessageWithParams("blxr_tx", serializedRequest)
++			err = client.CallContextWithMessage(context.Background(), &result, msg)
++			if err != nil {
++				if err, ok := err.(rpc.DataError); ok {
++					log.Error("Sending transaction to bloXroute API failed", "err", err.Error(), "details", err.ErrorData(), "hash", txHash, "url", client.endpoint)
++				} else {
++					log.Error("Sending transaction to bloXroute API failed", "err", err, "hash", txHash, "url", client.endpoint)
++				}
++			} else {
++				log.Debug("Submitted transaction to bloXroute API", "hash", txHash, "url", client.endpoint)
++			}
++		}
++	}()
++}
++
++type blxrTxRequest struct {
++	Transaction    string `json:"transaction"`
++	ValidatorsOnly bool   `json:"validators_only"`
++}
++
++type blxrTxResponse struct {
++	Hash string `json:"txHash"`
++}
+diff --git a/rpc/client.go b/rpc/client.go
+index 422c6cd6f34a..44846ef1a585 100644
+--- a/rpc/client.go
++++ b/rpc/client.go
+@@ -297,7 +297,11 @@ func (c *Client) CallContext(ctx context.Context, result interface{}, method str
+ 	return c.CallContextWithMessage(ctx, result, msg)
+ }
+ 
+-// TODO:
++// CallContextWithMessage performs a JSON-RPC call with the given arguments, allowing a custom formed RPC message.
++// If the context is canceled before the call has successfully return, CallContextWithMessage returns immediately.
++//
++// The result must be a pointer so that package json can unmarshal into it. You
++// can also pass nil, in which case the result is ignored.
+ func (c *Client) CallContextWithMessage(ctx context.Context, result interface{}, msg *JSONRPCMessage) error {
+ 	if result != nil && reflect.TypeOf(result).Kind() != reflect.Ptr {
+ 		return fmt.Errorf("call result parameter must be pointer or nil interface: %v", result)
+@@ -470,6 +474,8 @@ func (c *Client) Subscribe(ctx context.Context, namespace string, channel interf
+ 	return op.sub, nil
+ }
+ 
++// NewMessage constructs a new RPC message for sending with the provided params.
++// NewMessage serializes the provided params using json.Marshal
+ func (c *Client) NewMessage(method string, paramsIn ...interface{}) (*JSONRPCMessage, error) {
+ 	var (
+ 		params json.RawMessage
+@@ -483,6 +489,8 @@ func (c *Client) NewMessage(method string, paramsIn ...interface{}) (*JSONRPCMes
+ 	return c.NewMessageWithParams(method, params), nil
+ }
+ 
++// NewMessageWithParams constructs a new RPC message for sending with the provided params.
++// NewMessageWithParams allows passing in raw JSON blobs to skip the serialization step.
+ func (c *Client) NewMessageWithParams(method string, params json.RawMessage) *JSONRPCMessage {
+ 	msg := &JSONRPCMessage{Version: vsn, ID: c.nextID(), Method: method}
+ 	if params != nil { // prevent sending "params":null
+diff --git a/rpc/websocket.go b/rpc/websocket.go
+index 2004e4504d5f..bdd0184e9a85 100644
+--- a/rpc/websocket.go
++++ b/rpc/websocket.go
+@@ -218,6 +218,7 @@ func DialWebsocket(ctx context.Context, endpoint, origin string) (*Client, error
+ 	return DialWebsocketWithDialer(ctx, endpoint, origin, WebsocketDialer())
+ }
+ 
++// WebsocketDialer allocates a dialer with default buffer parameters set.
+ func WebsocketDialer() websocket.Dialer {
+ 	return websocket.Dialer{
+ 		ReadBufferSize:  wsReadBuffer,
+
+From 684f291e651439f868809230efa799150a2d4ec1 Mon Sep 17 00:00:00 2001
+From: Kevin Chen <kevin@bloxroute.com>
+Date: Fri, 11 Feb 2022 15:24:41 -0600
+Subject: [PATCH 5/7] Revert changes to RPC client
+
+---
+ eth/bxapi.go             |  8 +----
+ rpc/client.go            | 70 +++++++++++++---------------------------
+ rpc/client_test.go       |  2 +-
+ rpc/handler.go           | 22 ++++++-------
+ rpc/http.go              |  8 ++---
+ rpc/json.go              | 42 ++++++++++++------------
+ rpc/subscription.go      |  2 +-
+ rpc/subscription_test.go |  2 +-
+ rpc/types.go             |  2 +-
+ 9 files changed, 64 insertions(+), 94 deletions(-)
+
+diff --git a/eth/bxapi.go b/eth/bxapi.go
+index 0230493feb79..ae0dfde6bfb3 100644
+--- a/eth/bxapi.go
++++ b/eth/bxapi.go
+@@ -3,7 +3,6 @@ package eth
+ import (
+ 	"context"
+ 	"encoding/hex"
+-	"encoding/json"
+ 	"errors"
+ 	"github.com/ethereum/go-ethereum/core/types"
+ 	"github.com/ethereum/go-ethereum/eth/ethconfig"
+@@ -72,15 +71,10 @@ func (b BxAPIClients) SubmitTx(ctx context.Context, tx *types.Transaction) {
+ 		request := blxrTxRequest{
+ 			Transaction: hex.EncodeToString(txBytes),
+ 		}
+-		serializedRequest, err := json.Marshal(request)
+-		if err != nil {
+-			log.Error("Failed serializing transaction for sending to bloXroute API", "err", err, "hash", txHash)
+-		}
+ 
+ 		for _, client := range b {
+ 			var result blxrTxResponse
+-			msg := client.NewMessageWithParams("blxr_tx", serializedRequest)
+-			err = client.CallContextWithMessage(context.Background(), &result, msg)
++			err = client.CallContext(context.Background(), &result, "blxr_tx", request)
+ 			if err != nil {
+ 				if err, ok := err.(rpc.DataError); ok {
+ 					log.Error("Sending transaction to bloXroute API failed", "err", err.Error(), "details", err.ErrorData(), "hash", txHash, "url", client.endpoint)
+diff --git a/rpc/client.go b/rpc/client.go
+index 44846ef1a585..d55af75545cd 100644
+--- a/rpc/client.go
++++ b/rpc/client.go
+@@ -122,18 +122,18 @@ func (cc *clientConn) close(err error, inflightReq *requestOp) {
+ }
+ 
+ type readOp struct {
+-	msgs  []*JSONRPCMessage
++	msgs  []*jsonrpcMessage
+ 	batch bool
+ }
+ 
+ type requestOp struct {
+ 	ids  []json.RawMessage
+ 	err  error
+-	resp chan *JSONRPCMessage // receives up to len(ids) responses
++	resp chan *jsonrpcMessage // receives up to len(ids) responses
+ 	sub  *ClientSubscription  // only set for EthSubscribe requests
+ }
+ 
+-func (op *requestOp) wait(ctx context.Context, c *Client) (*JSONRPCMessage, error) {
++func (op *requestOp) wait(ctx context.Context, c *Client) (*jsonrpcMessage, error) {
+ 	select {
+ 	case <-ctx.Done():
+ 		// Send the timeout to dispatch so it can remove the request IDs.
+@@ -290,24 +290,14 @@ func (c *Client) Call(result interface{}, method string, args ...interface{}) er
+ // The result must be a pointer so that package json can unmarshal into it. You
+ // can also pass nil, in which case the result is ignored.
+ func (c *Client) CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error {
+-	msg, err := c.NewMessage(method, args...)
+-	if err != nil {
+-		return err
+-	}
+-	return c.CallContextWithMessage(ctx, result, msg)
+-}
+-
+-// CallContextWithMessage performs a JSON-RPC call with the given arguments, allowing a custom formed RPC message.
+-// If the context is canceled before the call has successfully return, CallContextWithMessage returns immediately.
+-//
+-// The result must be a pointer so that package json can unmarshal into it. You
+-// can also pass nil, in which case the result is ignored.
+-func (c *Client) CallContextWithMessage(ctx context.Context, result interface{}, msg *JSONRPCMessage) error {
+ 	if result != nil && reflect.TypeOf(result).Kind() != reflect.Ptr {
+ 		return fmt.Errorf("call result parameter must be pointer or nil interface: %v", result)
+ 	}
+-	var err error
+-	op := &requestOp{ids: []json.RawMessage{msg.ID}, resp: make(chan *JSONRPCMessage, 1)}
++	msg, err := c.newMessage(method, args...)
++	if err != nil {
++		return err
++	}
++	op := &requestOp{ids: []json.RawMessage{msg.ID}, resp: make(chan *jsonrpcMessage, 1)}
+ 
+ 	if c.isHTTP {
+ 		err = c.sendHTTP(ctx, op, msg)
+@@ -354,15 +344,15 @@ func (c *Client) BatchCall(b []BatchElem) error {
+ // Note that batch calls may not be executed atomically on the server side.
+ func (c *Client) BatchCallContext(ctx context.Context, b []BatchElem) error {
+ 	var (
+-		msgs = make([]*JSONRPCMessage, len(b))
++		msgs = make([]*jsonrpcMessage, len(b))
+ 		byID = make(map[string]int, len(b))
+ 	)
+ 	op := &requestOp{
+ 		ids:  make([]json.RawMessage, len(b)),
+-		resp: make(chan *JSONRPCMessage, len(b)),
++		resp: make(chan *jsonrpcMessage, len(b)),
+ 	}
+ 	for i, elem := range b {
+-		msg, err := c.NewMessage(elem.Method, elem.Args...)
++		msg, err := c.newMessage(elem.Method, elem.Args...)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -380,7 +370,7 @@ func (c *Client) BatchCallContext(ctx context.Context, b []BatchElem) error {
+ 
+ 	// Wait for all responses to come back.
+ 	for n := 0; n < len(b) && err == nil; n++ {
+-		var resp *JSONRPCMessage
++		var resp *jsonrpcMessage
+ 		resp, err = op.wait(ctx, c)
+ 		if err != nil {
+ 			break
+@@ -405,7 +395,7 @@ func (c *Client) BatchCallContext(ctx context.Context, b []BatchElem) error {
+ // Notify sends a notification, i.e. a method call that doesn't expect a response.
+ func (c *Client) Notify(ctx context.Context, method string, args ...interface{}) error {
+ 	op := new(requestOp)
+-	msg, err := c.NewMessage(method, args...)
++	msg, err := c.newMessage(method, args...)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -453,13 +443,13 @@ func (c *Client) Subscribe(ctx context.Context, namespace string, channel interf
+ 		return nil, ErrNotificationsUnsupported
+ 	}
+ 
+-	msg, err := c.NewMessage(namespace+subscribeMethodSuffix, args...)
++	msg, err := c.newMessage(namespace+subscribeMethodSuffix, args...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	op := &requestOp{
+ 		ids:  []json.RawMessage{msg.ID},
+-		resp: make(chan *JSONRPCMessage),
++		resp: make(chan *jsonrpcMessage),
+ 		sub:  newClientSubscription(c, namespace, chanVal),
+ 	}
+ 
+@@ -474,29 +464,15 @@ func (c *Client) Subscribe(ctx context.Context, namespace string, channel interf
+ 	return op.sub, nil
+ }
+ 
+-// NewMessage constructs a new RPC message for sending with the provided params.
+-// NewMessage serializes the provided params using json.Marshal
+-func (c *Client) NewMessage(method string, paramsIn ...interface{}) (*JSONRPCMessage, error) {
+-	var (
+-		params json.RawMessage
+-		err    error
+-	)
+-
+-	if params, err = json.Marshal(paramsIn); err != nil {
+-		return nil, err
+-	}
+-
+-	return c.NewMessageWithParams(method, params), nil
+-}
+-
+-// NewMessageWithParams constructs a new RPC message for sending with the provided params.
+-// NewMessageWithParams allows passing in raw JSON blobs to skip the serialization step.
+-func (c *Client) NewMessageWithParams(method string, params json.RawMessage) *JSONRPCMessage {
+-	msg := &JSONRPCMessage{Version: vsn, ID: c.nextID(), Method: method}
+-	if params != nil { // prevent sending "params":null
+-		msg.Params = params
++func (c *Client) newMessage(method string, paramsIn ...interface{}) (*jsonrpcMessage, error) {
++	msg := &jsonrpcMessage{Version: vsn, ID: c.nextID(), Method: method}
++	if paramsIn != nil { // prevent sending "params":null
++		var err error
++		if msg.Params, err = json.Marshal(paramsIn); err != nil {
++			return nil, err
++		}
+ 	}
+-	return msg
++	return msg, nil
+ }
+ 
+ // send registers op with the dispatch loop, then sends msg on the connection.
+diff --git a/rpc/client_test.go b/rpc/client_test.go
+index 2c3012392f5a..fa6010bb199c 100644
+--- a/rpc/client_test.go
++++ b/rpc/client_test.go
+@@ -383,7 +383,7 @@ type unsubscribeRecorder struct {
+ 	unsubscribes map[string]bool
+ }
+ 
+-func (r *unsubscribeRecorder) readBatch() ([]*JSONRPCMessage, bool, error) {
++func (r *unsubscribeRecorder) readBatch() ([]*jsonrpcMessage, bool, error) {
+ 	if r.unsubscribes == nil {
+ 		r.unsubscribes = make(map[string]bool)
+ 	}
+diff --git a/rpc/handler.go b/rpc/handler.go
+index e04b378f5287..488a29300a10 100644
+--- a/rpc/handler.go
++++ b/rpc/handler.go
+@@ -93,7 +93,7 @@ func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *
+ }
+ 
+ // handleBatch executes all messages in a batch and returns the responses.
+-func (h *handler) handleBatch(msgs []*JSONRPCMessage) {
++func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
+ 	// Emit error response for empty batches:
+ 	if len(msgs) == 0 {
+ 		h.startCallProc(func(cp *callProc) {
+@@ -103,7 +103,7 @@ func (h *handler) handleBatch(msgs []*JSONRPCMessage) {
+ 	}
+ 
+ 	// Handle non-call messages first:
+-	calls := make([]*JSONRPCMessage, 0, len(msgs))
++	calls := make([]*jsonrpcMessage, 0, len(msgs))
+ 	for _, msg := range msgs {
+ 		if handled := h.handleImmediate(msg); !handled {
+ 			calls = append(calls, msg)
+@@ -114,7 +114,7 @@ func (h *handler) handleBatch(msgs []*JSONRPCMessage) {
+ 	}
+ 	// Process calls on a goroutine because they may block indefinitely:
+ 	h.startCallProc(func(cp *callProc) {
+-		answers := make([]*JSONRPCMessage, 0, len(msgs))
++		answers := make([]*jsonrpcMessage, 0, len(msgs))
+ 		for _, msg := range calls {
+ 			if answer := h.handleCallMsg(cp, msg); answer != nil {
+ 				answers = append(answers, answer)
+@@ -131,7 +131,7 @@ func (h *handler) handleBatch(msgs []*JSONRPCMessage) {
+ }
+ 
+ // handleMsg handles a single message.
+-func (h *handler) handleMsg(msg *JSONRPCMessage) {
++func (h *handler) handleMsg(msg *jsonrpcMessage) {
+ 	if ok := h.handleImmediate(msg); ok {
+ 		return
+ 	}
+@@ -229,7 +229,7 @@ func (h *handler) startCallProc(fn func(*callProc)) {
+ 
+ // handleImmediate executes non-call messages. It returns false if the message is a
+ // call or requires a reply.
+-func (h *handler) handleImmediate(msg *JSONRPCMessage) bool {
++func (h *handler) handleImmediate(msg *jsonrpcMessage) bool {
+ 	start := time.Now()
+ 	switch {
+ 	case msg.isNotification():
+@@ -248,7 +248,7 @@ func (h *handler) handleImmediate(msg *JSONRPCMessage) bool {
+ }
+ 
+ // handleSubscriptionResult processes subscription notifications.
+-func (h *handler) handleSubscriptionResult(msg *JSONRPCMessage) {
++func (h *handler) handleSubscriptionResult(msg *jsonrpcMessage) {
+ 	var result subscriptionResult
+ 	if err := json.Unmarshal(msg.Params, &result); err != nil {
+ 		h.log.Debug("Dropping invalid subscription message")
+@@ -260,7 +260,7 @@ func (h *handler) handleSubscriptionResult(msg *JSONRPCMessage) {
+ }
+ 
+ // handleResponse processes method call responses.
+-func (h *handler) handleResponse(msg *JSONRPCMessage) {
++func (h *handler) handleResponse(msg *jsonrpcMessage) {
+ 	op := h.respWait[string(msg.ID)]
+ 	if op == nil {
+ 		h.log.Debug("Unsolicited RPC response", "reqid", idForLog{msg.ID})
+@@ -287,7 +287,7 @@ func (h *handler) handleResponse(msg *JSONRPCMessage) {
+ }
+ 
+ // handleCallMsg executes a call message and returns the answer.
+-func (h *handler) handleCallMsg(ctx *callProc, msg *JSONRPCMessage) *JSONRPCMessage {
++func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
+ 	start := time.Now()
+ 	switch {
+ 	case msg.isNotification():
+@@ -316,7 +316,7 @@ func (h *handler) handleCallMsg(ctx *callProc, msg *JSONRPCMessage) *JSONRPCMess
+ }
+ 
+ // handleCall processes method calls.
+-func (h *handler) handleCall(cp *callProc, msg *JSONRPCMessage) *JSONRPCMessage {
++func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
+ 	if msg.isSubscribe() {
+ 		return h.handleSubscribe(cp, msg)
+ 	}
+@@ -352,7 +352,7 @@ func (h *handler) handleCall(cp *callProc, msg *JSONRPCMessage) *JSONRPCMessage
+ }
+ 
+ // handleSubscribe processes *_subscribe method calls.
+-func (h *handler) handleSubscribe(cp *callProc, msg *JSONRPCMessage) *JSONRPCMessage {
++func (h *handler) handleSubscribe(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
+ 	if !h.allowSubscribe {
+ 		return msg.errorResponse(ErrNotificationsUnsupported)
+ 	}
+@@ -385,7 +385,7 @@ func (h *handler) handleSubscribe(cp *callProc, msg *JSONRPCMessage) *JSONRPCMes
+ }
+ 
+ // runMethod runs the Go callback for an RPC method.
+-func (h *handler) runMethod(ctx context.Context, msg *JSONRPCMessage, callb *callback, args []reflect.Value) *JSONRPCMessage {
++func (h *handler) runMethod(ctx context.Context, msg *jsonrpcMessage, callb *callback, args []reflect.Value) *jsonrpcMessage {
+ 	result, err := callb.call(ctx, msg.Method, args)
+ 	if err != nil {
+ 		return msg.errorResponse(err)
+diff --git a/rpc/http.go b/rpc/http.go
+index 3de41acf7126..c4afd9e9bca5 100644
+--- a/rpc/http.go
++++ b/rpc/http.go
+@@ -64,7 +64,7 @@ func (hc *httpConn) remoteAddr() string {
+ 	return hc.url
+ }
+ 
+-func (hc *httpConn) readBatch() ([]*JSONRPCMessage, bool, error) {
++func (hc *httpConn) readBatch() ([]*jsonrpcMessage, bool, error) {
+ 	<-hc.closeCh
+ 	return nil, false, io.EOF
+ }
+@@ -152,7 +152,7 @@ func (c *Client) sendHTTP(ctx context.Context, op *requestOp, msg interface{}) e
+ 	}
+ 	defer respBody.Close()
+ 
+-	var respmsg JSONRPCMessage
++	var respmsg jsonrpcMessage
+ 	if err := json.NewDecoder(respBody).Decode(&respmsg); err != nil {
+ 		return err
+ 	}
+@@ -160,14 +160,14 @@ func (c *Client) sendHTTP(ctx context.Context, op *requestOp, msg interface{}) e
+ 	return nil
+ }
+ 
+-func (c *Client) sendBatchHTTP(ctx context.Context, op *requestOp, msgs []*JSONRPCMessage) error {
++func (c *Client) sendBatchHTTP(ctx context.Context, op *requestOp, msgs []*jsonrpcMessage) error {
+ 	hc := c.writeConn.(*httpConn)
+ 	respBody, err := hc.doRequest(ctx, msgs)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer respBody.Close()
+-	var respmsgs []JSONRPCMessage
++	var respmsgs []jsonrpcMessage
+ 	if err := json.NewDecoder(respBody).Decode(&respmsgs); err != nil {
+ 		return err
+ 	}
+diff --git a/rpc/json.go b/rpc/json.go
+index ad4d63ad7ab2..6024f1e7dc9b 100644
+--- a/rpc/json.go
++++ b/rpc/json.go
+@@ -48,7 +48,7 @@ type subscriptionResult struct {
+ 
+ // A value of this type can a JSON-RPC request, notification, successful response or
+ // error response. Which one it is depends on the fields.
+-type JSONRPCMessage struct {
++type jsonrpcMessage struct {
+ 	Version string          `json:"jsonrpc,omitempty"`
+ 	ID      json.RawMessage `json:"id,omitempty"`
+ 	Method  string          `json:"method,omitempty"`
+@@ -57,57 +57,57 @@ type JSONRPCMessage struct {
+ 	Result  json.RawMessage `json:"result,omitempty"`
+ }
+ 
+-func (msg *JSONRPCMessage) isNotification() bool {
++func (msg *jsonrpcMessage) isNotification() bool {
+ 	return msg.ID == nil && msg.Method != ""
+ }
+ 
+-func (msg *JSONRPCMessage) isCall() bool {
++func (msg *jsonrpcMessage) isCall() bool {
+ 	return msg.hasValidID() && msg.Method != ""
+ }
+ 
+-func (msg *JSONRPCMessage) isResponse() bool {
++func (msg *jsonrpcMessage) isResponse() bool {
+ 	return msg.hasValidID() && msg.Method == "" && msg.Params == nil && (msg.Result != nil || msg.Error != nil)
+ }
+ 
+-func (msg *JSONRPCMessage) hasValidID() bool {
++func (msg *jsonrpcMessage) hasValidID() bool {
+ 	return len(msg.ID) > 0 && msg.ID[0] != '{' && msg.ID[0] != '['
+ }
+ 
+-func (msg *JSONRPCMessage) isSubscribe() bool {
++func (msg *jsonrpcMessage) isSubscribe() bool {
+ 	return strings.HasSuffix(msg.Method, subscribeMethodSuffix)
+ }
+ 
+-func (msg *JSONRPCMessage) isUnsubscribe() bool {
++func (msg *jsonrpcMessage) isUnsubscribe() bool {
+ 	return strings.HasSuffix(msg.Method, unsubscribeMethodSuffix)
+ }
+ 
+-func (msg *JSONRPCMessage) namespace() string {
++func (msg *jsonrpcMessage) namespace() string {
+ 	elem := strings.SplitN(msg.Method, serviceMethodSeparator, 2)
+ 	return elem[0]
+ }
+ 
+-func (msg *JSONRPCMessage) String() string {
++func (msg *jsonrpcMessage) String() string {
+ 	b, _ := json.Marshal(msg)
+ 	return string(b)
+ }
+ 
+-func (msg *JSONRPCMessage) errorResponse(err error) *JSONRPCMessage {
++func (msg *jsonrpcMessage) errorResponse(err error) *jsonrpcMessage {
+ 	resp := errorMessage(err)
+ 	resp.ID = msg.ID
+ 	return resp
+ }
+ 
+-func (msg *JSONRPCMessage) response(result interface{}) *JSONRPCMessage {
++func (msg *jsonrpcMessage) response(result interface{}) *jsonrpcMessage {
+ 	enc, err := json.Marshal(result)
+ 	if err != nil {
+ 		// TODO: wrap with 'internal server error'
+ 		return msg.errorResponse(err)
+ 	}
+-	return &JSONRPCMessage{Version: vsn, ID: msg.ID, Result: enc}
++	return &jsonrpcMessage{Version: vsn, ID: msg.ID, Result: enc}
+ }
+ 
+-func errorMessage(err error) *JSONRPCMessage {
+-	msg := &JSONRPCMessage{Version: vsn, ID: null, Error: &jsonError{
++func errorMessage(err error) *jsonrpcMessage {
++	msg := &jsonrpcMessage{Version: vsn, ID: null, Error: &jsonError{
+ 		Code:    defaultErrorCode,
+ 		Message: err.Error(),
+ 	}}
+@@ -207,7 +207,7 @@ func (c *jsonCodec) remoteAddr() string {
+ 	return c.remote
+ }
+ 
+-func (c *jsonCodec) readBatch() (messages []*JSONRPCMessage, batch bool, err error) {
++func (c *jsonCodec) readBatch() (messages []*jsonrpcMessage, batch bool, err error) {
+ 	// Decode the next JSON object in the input stream.
+ 	// This verifies basic syntax, etc.
+ 	var rawmsg json.RawMessage
+@@ -219,7 +219,7 @@ func (c *jsonCodec) readBatch() (messages []*JSONRPCMessage, batch bool, err err
+ 		if msg == nil {
+ 			// Message is JSON 'null'. Replace with zero value so it
+ 			// will be treated like any other invalid message.
+-			messages[i] = new(JSONRPCMessage)
++			messages[i] = new(jsonrpcMessage)
+ 		}
+ 	}
+ 	return messages, batch, nil
+@@ -252,18 +252,18 @@ func (c *jsonCodec) closed() <-chan interface{} {
+ // parseMessage parses raw bytes as a (batch of) JSON-RPC message(s). There are no error
+ // checks in this function because the raw message has already been syntax-checked when it
+ // is called. Any non-JSON-RPC messages in the input return the zero value of
+-// JSONRPCMessage.
+-func parseMessage(raw json.RawMessage) ([]*JSONRPCMessage, bool) {
++// jsonrpcMessage.
++func parseMessage(raw json.RawMessage) ([]*jsonrpcMessage, bool) {
+ 	if !isBatch(raw) {
+-		msgs := []*JSONRPCMessage{{}}
++		msgs := []*jsonrpcMessage{{}}
+ 		json.Unmarshal(raw, &msgs[0])
+ 		return msgs, false
+ 	}
+ 	dec := json.NewDecoder(bytes.NewReader(raw))
+ 	dec.Token() // skip '['
+-	var msgs []*JSONRPCMessage
++	var msgs []*jsonrpcMessage
+ 	for dec.More() {
+-		msgs = append(msgs, new(JSONRPCMessage))
++		msgs = append(msgs, new(jsonrpcMessage))
+ 		dec.Decode(&msgs[len(msgs)-1])
+ 	}
+ 	return msgs, true
+diff --git a/rpc/subscription.go b/rpc/subscription.go
+index c6e8424b9df4..942e764e5d6c 100644
+--- a/rpc/subscription.go
++++ b/rpc/subscription.go
+@@ -175,7 +175,7 @@ func (n *Notifier) activate() error {
+ func (n *Notifier) send(sub *Subscription, data json.RawMessage) error {
+ 	params, _ := json.Marshal(&subscriptionResult{ID: string(sub.ID), Result: data})
+ 	ctx := context.Background()
+-	return n.h.conn.writeJSON(ctx, &JSONRPCMessage{
++	return n.h.conn.writeJSON(ctx, &jsonrpcMessage{
+ 		Version: vsn,
+ 		Method:  n.namespace + notificationMethodSuffix,
+ 		Params:  params,
+diff --git a/rpc/subscription_test.go b/rpc/subscription_test.go
+index 264556cfe8c0..54a053dba805 100644
+--- a/rpc/subscription_test.go
++++ b/rpc/subscription_test.go
+@@ -193,7 +193,7 @@ func waitForMessages(in *json.Decoder, successes chan subConfirmation, notificat
+ }
+ 
+ func readAndValidateMessage(in *json.Decoder) (*subConfirmation, *subscriptionResult, error) {
+-	var msg JSONRPCMessage
++	var msg jsonrpcMessage
+ 	if err := in.Decode(&msg); err != nil {
+ 		return nil, nil, fmt.Errorf("decode error: %v", err)
+ 	}
+diff --git a/rpc/types.go b/rpc/types.go
+index 43de6069c083..959e383723bd 100644
+--- a/rpc/types.go
++++ b/rpc/types.go
+@@ -41,7 +41,7 @@ type API struct {
+ // multiple go-routines concurrently.
+ type ServerCodec interface {
+ 	peerInfo() PeerInfo
+-	readBatch() (msgs []*JSONRPCMessage, isBatch bool, err error)
++	readBatch() (msgs []*jsonrpcMessage, isBatch bool, err error)
+ 	close()
+ 
+ 	jsonWriter
+
+From 63eb53a0ccceb49952782f170bf1904914d2b06d Mon Sep 17 00:00:00 2001
+From: Kevin Chen <kevin@bloxroute.com>
+Date: Mon, 21 Feb 2022 12:51:49 -0600
+Subject: [PATCH 6/7] setup allow-insecure flags
+
+---
+ cmd/geth/main.go        | 1 +
+ cmd/utils/flags.go      | 6 ++++++
+ eth/bxapi.go            | 9 ++++++++-
+ eth/ethconfig/config.go | 4 ++++
+ 4 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/cmd/geth/main.go b/cmd/geth/main.go
+index 62ada14d457b..008299ff749d 100644
+--- a/cmd/geth/main.go
++++ b/cmd/geth/main.go
+@@ -186,6 +186,7 @@ var (
+ 		utils.AllowUnprotectedTxs,
+ 		utils.BxAPIEndpointsFlag,
+ 		utils.BxAPIAuthHeaderFlag,
++		utils.BxAPIAllowInsecureFlag,
+ 	}
+ 
+ 	metricsFlags = []cli.Flag{
+diff --git a/cmd/utils/flags.go b/cmd/utils/flags.go
+index 70013c278f1d..001143b52af0 100644
+--- a/cmd/utils/flags.go
++++ b/cmd/utils/flags.go
+@@ -808,6 +808,11 @@ var (
+ 		Name:  "bx.api.auth",
+ 		Usage: "bloXroute account authorization header (see https://docs.bloxroute.com/apis/authorization-headers)",
+ 	}
++
++	BxAPIAllowInsecureFlag = cli.BoolFlag{
++		Name:  "bx.api.insecure",
++		Usage: "Allow self-signed certificates when posting to bloXroute APIs (necessary for specific Cloud API IP addresses)",
++	}
+ )
+ 
+ // MakeDataDir retrieves the currently requested data directory, terminating
+@@ -1076,6 +1081,7 @@ func setLes(ctx *cli.Context, cfg *ethconfig.Config) {
+ func setBx(ctx *cli.Context, cfg *ethconfig.Config) {
+ 	if ctx.GlobalIsSet(BxAPIAuthHeaderFlag.Name) {
+ 		cfg.BxAPIAuthHeader = ctx.GlobalString(BxAPIAuthHeaderFlag.Name)
++		cfg.BxAPIAllowInsecure = ctx.GlobalBool(BxAPIAllowInsecureFlag.Name)
+ 
+ 		endpoints := SplitAndTrim(ctx.GlobalString(BxAPIEndpointsFlag.Name))
+ 		for _, endpoint := range endpoints {
+diff --git a/eth/bxapi.go b/eth/bxapi.go
+index ae0dfde6bfb3..0da0fee357f5 100644
+--- a/eth/bxapi.go
++++ b/eth/bxapi.go
+@@ -2,6 +2,7 @@ package eth
+ 
+ import (
+ 	"context"
++	"crypto/tls"
+ 	"encoding/hex"
+ 	"errors"
+ 	"github.com/ethereum/go-ethereum/core/types"
+@@ -42,7 +43,13 @@ func NewBxAPIClients(config *ethconfig.Config) BxAPIClients {
+ 		)
+ 		switch endpoint.Scheme {
+ 		case "http", "https":
+-			client, err = rpc.DialHTTPWithClientHeaders(endpoint.String(), new(http.Client), httpHeaders)
++			httpClient := new(http.Client)
++			if config.BxAPIAllowInsecure {
++				httpClient.Transport = &http.Transport{
++					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
++				}
++			}
++			client, err = rpc.DialHTTPWithClientHeaders(endpoint.String(), httpClient, httpHeaders)
+ 		case "ws", "wss":
+ 			client, err = rpc.DialWebsocketWithDialerHeaders(context.Background(), endpoint.String(), "", rpc.WebsocketDialer(), wsHeaders)
+ 		default:
+diff --git a/eth/ethconfig/config.go b/eth/ethconfig/config.go
+index 1a52bbde131d..c70f61195975 100644
+--- a/eth/ethconfig/config.go
++++ b/eth/ethconfig/config.go
+@@ -206,6 +206,10 @@ type Config struct {
+ 	// This field must be set (even "" for local gateways) for any forwarding.
+ 	BxAPIAuthHeader string
+ 
++	// BxAPIAllowInsecure allows self-signed CA certificates when submitting blxr_tx RPC requests.
++	// This is necessary for https endpoints to specific Cloud API IP addresses.
++	BxAPIAllowInsecure bool
++
+ 	// Checkpoint is a hardcoded checkpoint which can be nil.
+ 	Checkpoint *params.TrustedCheckpoint `toml:",omitempty"`
+ 
+
+From ce16e43230dbb4b605258c020a1861827ea26e95 Mon Sep 17 00:00:00 2001
+From: Kevin Chen <kevin@bloxroute.com>
+Date: Mon, 21 Feb 2022 13:01:35 -0600
+Subject: [PATCH 7/7] Fix an error message not printing
+
+---
+ cmd/utils/flags.go | 2 +-
+ eth/bxapi.go       | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/cmd/utils/flags.go b/cmd/utils/flags.go
+index 001143b52af0..f35cc411898a 100644
+--- a/cmd/utils/flags.go
++++ b/cmd/utils/flags.go
+@@ -810,7 +810,7 @@ var (
+ 	}
+ 
+ 	BxAPIAllowInsecureFlag = cli.BoolFlag{
+-		Name:  "bx.api.insecure",
++		Name:  "bx.api.allowinsecure",
+ 		Usage: "Allow self-signed certificates when posting to bloXroute APIs (necessary for specific Cloud API IP addresses)",
+ 	}
+ )
+diff --git a/eth/bxapi.go b/eth/bxapi.go
+index 0da0fee357f5..0ddb4d910577 100644
+--- a/eth/bxapi.go
++++ b/eth/bxapi.go
+@@ -83,8 +83,8 @@ func (b BxAPIClients) SubmitTx(ctx context.Context, tx *types.Transaction) {
+ 			var result blxrTxResponse
+ 			err = client.CallContext(context.Background(), &result, "blxr_tx", request)
+ 			if err != nil {
+-				if err, ok := err.(rpc.DataError); ok {
+-					log.Error("Sending transaction to bloXroute API failed", "err", err.Error(), "details", err.ErrorData(), "hash", txHash, "url", client.endpoint)
++				if serr, ok := err.(rpc.DataError); ok {
++					log.Error("Sending transaction to bloXroute API failed", "err", serr.Error(), "details", serr.ErrorData(), "hash", txHash, "url", client.endpoint)
+ 				} else {
+ 					log.Error("Sending transaction to bloXroute API failed", "err", err, "hash", txHash, "url", client.endpoint)
+ 				}
