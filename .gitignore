@@ -13,3 +13,49 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+.DS_Store
+node_modules
+
+/tmp
+*/**/*un~
+*/**/*.test
+*un~
+.DS_Store
+*/**/.DS_Store
+.ethtest
+*/**/*tx_database*
+*/**/*dapps*
+build/_vendor/pkg
+
+#*
+.#*
+*#
+*~
+.project
+.settings
+
+# used by the Makefile
+/build/_workspace/
+/build/cache/
+/build/bin/
+/geth*.zip
+
+# travis
+profile.tmp
+profile.cov
+
+# IdeaIDE
+.idea
+
+# VS Code
+.vscode
+
+# dashboard
+/dashboard/assets/flow-typed
+/dashboard/assets/node_modules
+/dashboard/assets/stats.json
+/dashboard/assets/bundle.js
+/dashboard/assets/bundle.js.map
+/dashboard/assets/package-lock.json
+
+**/yarn-error.log
