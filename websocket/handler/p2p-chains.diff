@@ -1,0 +1,202 @@
+diff --git a/eth/handler.go b/eth/handler.go
+index 06a8088bf07c..6d9af08b25d6 100644
+--- a/eth/handler.go
++++ b/eth/handler.go
+@@ -17,9 +17,12 @@
+ package eth
+ 
+ import (
++	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"math"
+ 	"math/big"
++	"net/http"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -38,6 +41,8 @@ import (
+ 	"github.com/ethereum/go-ethereum/p2p"
+ 	"github.com/ethereum/go-ethereum/params"
+ 	"github.com/ethereum/go-ethereum/trie"
++	"github.com/gobwas/ws"
++	"github.com/gobwas/ws/wsutil"
+ )
+ 
+ const (
+@@ -88,6 +93,9 @@ type handlerConfig struct {
+ }
+ 
+ type handler struct {
++	subPeerAdded chan *eth.Peer
++	subPeerLost  chan *eth.Peer
++
+ 	networkID  uint64
+ 	forkFilter forkid.Filter // Fork ID filter, constant across the lifetime of the node
+ 
+@@ -131,15 +139,17 @@ func newHandler(config *handlerConfig) (*handler, error) {
+ 		config.EventMux = new(event.TypeMux) // Nicety initialization for tests
+ 	}
+ 	h := &handler{
+-		networkID:  config.Network,
+-		forkFilter: forkid.NewFilter(config.Chain),
+-		eventMux:   config.EventMux,
+-		database:   config.Database,
+-		txpool:     config.TxPool,
+-		chain:      config.Chain,
+-		peers:      newPeerSet(),
+-		whitelist:  config.Whitelist,
+-		quitSync:   make(chan struct{}),
++		subPeerAdded: make(chan *eth.Peer),
++		subPeerLost:  make(chan *eth.Peer),
++		networkID:    config.Network,
++		forkFilter:   forkid.NewFilter(config.Chain),
++		eventMux:     config.EventMux,
++		database:     config.Database,
++		txpool:       config.TxPool,
++		chain:        config.Chain,
++		peers:        newPeerSet(),
++		whitelist:    config.Whitelist,
++		quitSync:     make(chan struct{}),
+ 	}
+ 	if config.Sync == downloader.FullSync {
+ 		// The database seems empty as the current block is the genesis. Yet the fast
+@@ -287,6 +297,10 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
+ 	}
+ 	defer h.unregisterPeer(peer.ID())
+ 
++	go func() {
++		h.subPeerAdded <- peer
++	}()
++
+ 	p := h.peers.peer(peer.ID())
+ 	if p == nil {
+ 		return errors.New("peer dropped during handling")
+@@ -379,6 +393,12 @@ func (h *handler) unregisterPeer(id string) {
+ 	// Remove the `eth` peer if it exists
+ 	logger.Debug("Removing Ethereum peer", "snap", peer.snapExt != nil)
+ 
++	p := h.peers.peer(id).Peer
++	go func() {
++		// confusing as hell this struct wrapping
++		h.subPeerLost <- p
++	}()
++
+ 	// Remove the `snap` extension if it exists
+ 	if peer.snapExt != nil {
+ 		h.downloader.SnapSyncer.Unregister(id)
+@@ -386,9 +406,11 @@ func (h *handler) unregisterPeer(id string) {
+ 	h.downloader.UnregisterPeer(id)
+ 	h.txFetcher.Drop(id)
+ 
++	// this is racy
+ 	if err := h.peers.unregisterPeer(id); err != nil {
+ 		logger.Error("Ethereum peer removal failed", "err", err)
+ 	}
++
+ }
+ 
+ func (h *handler) Start(maxPeers int) {
+@@ -408,6 +430,65 @@ func (h *handler) Start(maxPeers int) {
+ 	// start sync handlers
+ 	h.wg.Add(1)
+ 	go h.chainSync.loop()
++
++	fmt.Println("starting http server")
++
++	go func() {
++
++		http.ListenAndServe(":8080",
++			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				conn, _, _, err := ws.UpgradeHTTP(r, w)
++				defer conn.Close()
++
++				if err != nil {
++					fmt.Println("something issue on upgrade", err)
++					return
++				}
++
++				msg, op, err := wsutil.ReadClientData(conn)
++				if err != nil {
++					fmt.Println("some websocket issue, client probably closed", err, time.Now())
++					return
++				}
++
++				// just the initial for now -
++				if op.IsData() {
++					fmt.Println("initial message from term sub", string(msg))
++					for {
++						select {
++						case newPeer := <-h.subPeerAdded:
++							fmt.Println("new peer", newPeer)
++							remote := newPeer.RemoteAddr().String()
++							peerAdded, err := json.MarshalIndent(
++								map[string]interface{}{
++									"plain-ip": newPeer.Peer.Node().IP(),
++									"remote":   remote,
++									"local":    newPeer.LocalAddr().String(),
++									"enode":    newPeer.Info().Enode,
++								}, " ", "",
++							)
++							if err != nil {
++								fmt.Println("something off", err)
++								return
++							}
++
++							if err := wsutil.WriteServerMessage(
++								conn, ws.OpBinary, peerAdded,
++							); err != nil {
++								fmt.Println("write message issue", err, time.Now())
++								return
++							}
++
++						case lostPeer := <-h.subPeerLost:
++							fmt.Println("lost peer", lostPeer)
++						}
++					}
++				}
++
++			}),
++		)
++	}()
++
+ }
+ 
+ func (h *handler) Stop() {
+diff --git a/go.mod b/go.mod
+index 5f4330af3ea9..e2a78d2fb759 100644
+--- a/go.mod
++++ b/go.mod
+@@ -29,6 +29,7 @@ require (
+ 	github.com/go-ole/go-ole v1.2.1 // indirect
+ 	github.com/go-sourcemap/sourcemap v2.1.2+incompatible // indirect
+ 	github.com/go-stack/stack v1.8.0
++	github.com/gobwas/ws v1.1.0 // indirect
+ 	github.com/golang/protobuf v1.4.3
+ 	github.com/golang/snappy v0.0.4
+ 	github.com/google/gofuzz v1.1.1-0.20200604201612-c04b05f3adfa
+diff --git a/go.sum b/go.sum
+index 0890b8c5e04c..399c919c270c 100644
+--- a/go.sum
++++ b/go.sum
+@@ -162,6 +162,12 @@ github.com/go-sourcemap/sourcemap v2.1.2+incompatible/go.mod h1:F8jJfvm2KbVjc5Nq
+ github.com/go-sql-driver/mysql v1.4.1/go.mod h1:zAC/RDZ24gD3HViQzih4MyKcchzm+sOG5ZlKdlhCg5w=
+ github.com/go-stack/stack v1.8.0 h1:5SgMzNM5HxrEjV0ww2lTmX6E2Izsfxas4+YHWRs3Lsk=
+ github.com/go-stack/stack v1.8.0/go.mod h1:v0f6uXyyMGvRgIKkXu+yp6POWl0qKG85gN/melR3HDY=
++github.com/gobwas/httphead v0.1.0 h1:exrUm0f4YX0L7EBwZHuCF4GDp8aJfVeBrlLQrs6NqWU=
++github.com/gobwas/httphead v0.1.0/go.mod h1:O/RXo79gxV8G+RqlR/otEwx4Q36zl9rqC5u12GKvMCM=
++github.com/gobwas/pool v0.2.1 h1:xfeeEhW7pwmX8nuLVlqbzVc7udMDrwetjEv+TZIz1og=
++github.com/gobwas/pool v0.2.1/go.mod h1:q8bcK0KcYlCgd9e7WYLm9LpyS+YeLd8JVDW6WezmKEw=
++github.com/gobwas/ws v1.1.0 h1:7RFti/xnNkMJnrK7D1yQ/iCIB5OrrY/54/H930kIbHA=
++github.com/gobwas/ws v1.1.0/go.mod h1:nzvNcVha5eUziGrbxFCo6qFIojQHjJV5cLYIbezhfL0=
+ github.com/gofrs/uuid v3.3.0+incompatible/go.mod h1:b2aQJv3Z4Fp6yNu3cdSllBxTCLRxnplIgP/c0N/04lM=
+ github.com/gogo/protobuf v1.1.1/go.mod h1:r8qH/GZQm5c6nD/R0oafs1akxWv10x8SbQlK7atdtwQ=
+ github.com/gogo/protobuf v1.3.1/go.mod h1:SlYgWuQ5SjCEi6WLHjHCa1yvBfUnHcTbrrZtXPKa29o=
+@@ -526,6 +532,7 @@ golang.org/x/sys v0.0.0-20200814200057-3d37ad5750ed/go.mod h1:h1NjWce9XRLGQEsW7w
+ golang.org/x/sys v0.0.0-20200826173525-f9321e4c35a6/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200930185726-fdedc70b468f/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20201119102817-f84b799fce68/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
++golang.org/x/sys v0.0.0-20201207223542-d4d67f95c62d/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20210119212857-b64e53b001e4/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20210124154548-22da62e12c0c/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20210316164454-77fc1eacc6aa/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
