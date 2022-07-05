@@ -1,0 +1,272 @@
+diff --git a/cmd/geth/accountcmd_test.go b/cmd/geth/accountcmd_test.go
+index 0c22e8c9bf57..bbde27c3785a 100644
+--- a/cmd/geth/accountcmd_test.go
++++ b/cmd/geth/accountcmd_test.go
+@@ -180,11 +180,12 @@ Fatal: could not decrypt key with given password
+ 
+ func TestUnlockFlag(t *testing.T) {
+ 	geth := runMinimalGeth(t, "--port", "0", "--ipcdisable", "--datadir", tmpDatadirWithKeystore(t),
+-		"--unlock", "f466859ead1932d743d622cb74fc058882e8648a", "js", "testdata/empty.js")
++		"--unlock", "f466859ead1932d743d622cb74fc058882e8648a", "console", "--exec", "loadScript('testdata/empty.js')")
+ 	geth.Expect(`
+ Unlocking account f466859ead1932d743d622cb74fc058882e8648a | Attempt 1/3
+ !! Unsupported terminal, password will be echoed.
+ Password: {{.InputLine "foobar"}}
++undefined
+ `)
+ 	geth.ExpectExit()
+ 
+@@ -201,7 +202,7 @@ Password: {{.InputLine "foobar"}}
+ 
+ func TestUnlockFlagWrongPassword(t *testing.T) {
+ 	geth := runMinimalGeth(t, "--port", "0", "--ipcdisable", "--datadir", tmpDatadirWithKeystore(t),
+-		"--unlock", "f466859ead1932d743d622cb74fc058882e8648a", "js", "testdata/empty.js")
++		"--unlock", "f466859ead1932d743d622cb74fc058882e8648a", "console", "--exec", "loadScript('testdata/empty.js')")
+ 
+ 	defer geth.ExpectExit()
+ 	geth.Expect(`
+@@ -219,7 +220,7 @@ Fatal: Failed to unlock account f466859ead1932d743d622cb74fc058882e8648a (could
+ // https://github.com/ethereum/go-ethereum/issues/1785
+ func TestUnlockFlagMultiIndex(t *testing.T) {
+ 	geth := runMinimalGeth(t, "--port", "0", "--ipcdisable", "--datadir", tmpDatadirWithKeystore(t),
+-		"--unlock", "f466859ead1932d743d622cb74fc058882e8648a", "--unlock", "0,2", "js", "testdata/empty.js")
++		"--unlock", "f466859ead1932d743d622cb74fc058882e8648a", "--unlock", "0,2", "console", "--exec", "loadScript('testdata/empty.js')")
+ 
+ 	geth.Expect(`
+ Unlocking account 0 | Attempt 1/3
+@@ -227,6 +228,7 @@ Unlocking account 0 | Attempt 1/3
+ Password: {{.InputLine "foobar"}}
+ Unlocking account 2 | Attempt 1/3
+ Password: {{.InputLine "foobar"}}
++undefined
+ `)
+ 	geth.ExpectExit()
+ 
+@@ -244,8 +246,11 @@ Password: {{.InputLine "foobar"}}
+ 
+ func TestUnlockFlagPasswordFile(t *testing.T) {
+ 	geth := runMinimalGeth(t, "--port", "0", "--ipcdisable", "--datadir", tmpDatadirWithKeystore(t),
+-		"--unlock", "f466859ead1932d743d622cb74fc058882e8648a", "--password", "testdata/passwords.txt", "--unlock", "0,2", "js", "testdata/empty.js")
++		"--unlock", "f466859ead1932d743d622cb74fc058882e8648a", "--password", "testdata/passwords.txt", "--unlock", "0,2", "console", "--exec", "loadScript('testdata/empty.js')")
+ 
++	geth.Expect(`
++undefined
++`)
+ 	geth.ExpectExit()
+ 
+ 	wantMessages := []string{
+@@ -275,7 +280,7 @@ func TestUnlockFlagAmbiguous(t *testing.T) {
+ 	geth := runMinimalGeth(t, "--port", "0", "--ipcdisable", "--datadir", tmpDatadirWithKeystore(t),
+ 		"--unlock", "f466859ead1932d743d622cb74fc058882e8648a", "--keystore",
+ 		store, "--unlock", "f466859ead1932d743d622cb74fc058882e8648a",
+-		"js", "testdata/empty.js")
++		"console", "--exec", "loadScript('testdata/empty.js')")
+ 	defer geth.ExpectExit()
+ 
+ 	// Helper for the expect template, returns absolute keystore path.
+@@ -294,6 +299,7 @@ Testing your password against all of them...
+ Your password unlocked keystore://{{keypath "1"}}
+ In order to avoid this warning, you need to remove the following duplicate key files:
+    keystore://{{keypath "2"}}
++undefined
+ `)
+ 	geth.ExpectExit()
+ 
+diff --git a/cmd/geth/consolecmd.go b/cmd/geth/consolecmd.go
+index 5167f8536a27..4f538f96e3f5 100644
+--- a/cmd/geth/consolecmd.go
++++ b/cmd/geth/consolecmd.go
+@@ -18,11 +18,9 @@ package main
+ 
+ import (
+ 	"fmt"
+-	"path/filepath"
+ 	"strings"
+ 
+ 	"github.com/ethereum/go-ethereum/cmd/utils"
+-	"github.com/ethereum/go-ethereum/common"
+ 	"github.com/ethereum/go-ethereum/console"
+ 	"github.com/ethereum/go-ethereum/node"
+ 	"github.com/ethereum/go-ethereum/rpc"
+@@ -61,7 +59,7 @@ This command allows to open a console on a running geth node.`,
+ 	javascriptCommand = cli.Command{
+ 		Action:    utils.MigrateFlags(ephemeralConsole),
+ 		Name:      "js",
+-		Usage:     "Execute the specified JavaScript files",
++		Usage:     "(DEPRECATED) Execute the specified JavaScript files",
+ 		ArgsUsage: "<jsfile> [jsfile...]",
+ 		Flags:     utils.GroupFlags(nodeFlags, consoleFlags),
+ 		Category:  "CONSOLE COMMANDS",
+@@ -121,31 +119,9 @@ func localConsole(ctx *cli.Context) error {
+ func remoteConsole(ctx *cli.Context) error {
+ 	endpoint := ctx.Args().First()
+ 	if endpoint == "" {
+-		path := node.DefaultDataDir()
+-		if ctx.GlobalIsSet(utils.DataDirFlag.Name) {
+-			path = ctx.GlobalString(utils.DataDirFlag.Name)
+-		}
+-		if path != "" {
+-			if ctx.GlobalBool(utils.RopstenFlag.Name) {
+-				// Maintain compatibility with older Geth configurations storing the
+-				// Ropsten database in `testnet` instead of `ropsten`.
+-				legacyPath := filepath.Join(path, "testnet")
+-				if common.FileExist(legacyPath) {
+-					path = legacyPath
+-				} else {
+-					path = filepath.Join(path, "ropsten")
+-				}
+-			} else if ctx.GlobalBool(utils.RinkebyFlag.Name) {
+-				path = filepath.Join(path, "rinkeby")
+-			} else if ctx.GlobalBool(utils.GoerliFlag.Name) {
+-				path = filepath.Join(path, "goerli")
+-			} else if ctx.GlobalBool(utils.SepoliaFlag.Name) {
+-				path = filepath.Join(path, "sepolia")
+-			} else if ctx.GlobalBool(utils.KilnFlag.Name) {
+-				path = filepath.Join(path, "kiln")
+-			}
+-		}
+-		endpoint = fmt.Sprintf("%s/geth.ipc", path)
++		cfg := defaultNodeConfig()
++		utils.SetDataDir(ctx, &cfg)
++		endpoint = cfg.IPCEndpoint()
+ 	}
+ 	client, err := dialRPC(endpoint)
+ 	if err != nil {
+@@ -174,6 +150,19 @@ func remoteConsole(ctx *cli.Context) error {
+ 	return nil
+ }
+ 
++// ephemeralConsole starts a new geth node, attaches an ephemeral JavaScript
++// console to it, executes each of the files specified as arguments and tears
++// everything down.
++func ephemeralConsole(ctx *cli.Context) error {
++	var b strings.Builder
++	for _, file := range ctx.Args() {
++		b.Write([]byte(fmt.Sprintf("loadScript('%s');", file)))
++	}
++	utils.Fatalf(`The "js" command is deprecated. Please use the following instead:
++geth --exec "%s" console`, b.String())
++	return nil
++}
++
+ // dialRPC returns a RPC client which connects to the given endpoint.
+ // The check for empty endpoint implements the defaulting logic
+ // for "geth attach" with no argument.
+@@ -187,48 +176,3 @@ func dialRPC(endpoint string) (*rpc.Client, error) {
+ 	}
+ 	return rpc.Dial(endpoint)
+ }
+-
+-// ephemeralConsole starts a new geth node, attaches an ephemeral JavaScript
+-// console to it, executes each of the files specified as arguments and tears
+-// everything down.
+-func ephemeralConsole(ctx *cli.Context) error {
+-	// Create and start the node based on the CLI flags
+-	stack, backend := makeFullNode(ctx)
+-	startNode(ctx, stack, backend, false)
+-	defer stack.Close()
+-
+-	// Attach to the newly started node and start the JavaScript console
+-	client, err := stack.Attach()
+-	if err != nil {
+-		return fmt.Errorf("Failed to attach to the inproc geth: %v", err)
+-	}
+-	config := console.Config{
+-		DataDir: utils.MakeDataDir(ctx),
+-		DocRoot: ctx.GlobalString(utils.JSpathFlag.Name),
+-		Client:  client,
+-		Preload: utils.MakeConsolePreloads(ctx),
+-	}
+-
+-	console, err := console.New(config)
+-	if err != nil {
+-		return fmt.Errorf("Failed to start the JavaScript console: %v", err)
+-	}
+-	defer console.Stop(false)
+-
+-	// Interrupt the JS interpreter when node is stopped.
+-	go func() {
+-		stack.Wait()
+-		console.Stop(false)
+-	}()
+-
+-	// Evaluate each of the specified JavaScript files.
+-	for _, file := range ctx.Args() {
+-		if err = console.Execute(file); err != nil {
+-			return fmt.Errorf("Failed to execute %s: %v", file, err)
+-		}
+-	}
+-
+-	// The main script is now done, but keep running timers/callbacks.
+-	console.Stop(true)
+-	return nil
+-}
+diff --git a/cmd/utils/flags.go b/cmd/utils/flags.go
+index 0b28cd09f141..d869f21cc4e3 100644
+--- a/cmd/utils/flags.go
++++ b/cmd/utils/flags.go
+@@ -1315,7 +1315,7 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
+ 	setGraphQL(ctx, cfg)
+ 	setWS(ctx, cfg)
+ 	setNodeUserIdent(ctx, cfg)
+-	setDataDir(ctx, cfg)
++	SetDataDir(ctx, cfg)
+ 	setSmartCard(ctx, cfg)
+ 
+ 	if ctx.GlobalIsSet(JWTSecretFlag.Name) {
+@@ -1366,7 +1366,7 @@ func setSmartCard(ctx *cli.Context, cfg *node.Config) {
+ 	cfg.SmartCardDaemonPath = path
+ }
+ 
+-func setDataDir(ctx *cli.Context, cfg *node.Config) {
++func SetDataDir(ctx *cli.Context, cfg *node.Config) {
+ 	switch {
+ 	case ctx.GlobalIsSet(DataDirFlag.Name):
+ 		cfg.DataDir = ctx.GlobalString(DataDirFlag.Name)
+diff --git a/console/console.go b/console/console.go
+index 2f61c1d7a4cf..c8f6c9cfeec5 100644
+--- a/console/console.go
++++ b/console/console.go
+@@ -540,11 +540,6 @@ func countIndents(input string) int {
+ 	return indents
+ }
+ 
+-// Execute runs the JavaScript file specified as the argument.
+-func (c *Console) Execute(path string) error {
+-	return c.jsre.Exec(path)
+-}
+-
+ // Stop cleans up the console and terminates the runtime environment.
+ func (c *Console) Stop(graceful bool) error {
+ 	c.stopOnce.Do(func() {
+diff --git a/console/console_test.go b/console/console_test.go
+index 04ba91d1576a..35341fcba0b5 100644
+--- a/console/console_test.go
++++ b/console/console_test.go
+@@ -234,19 +234,6 @@ func TestPreload(t *testing.T) {
+ 	}
+ }
+ 
+-// Tests that JavaScript scripts can be executes from the configured asset path.
+-func TestExecute(t *testing.T) {
+-	tester := newTester(t, nil)
+-	defer tester.Close(t)
+-
+-	tester.console.Execute("exec.js")
+-
+-	tester.console.Evaluate("execed")
+-	if output := tester.output.String(); !strings.Contains(output, "some-executed-string") {
+-		t.Fatalf("execed variable missing: have %s, want %s", output, "some-executed-string")
+-	}
+-}
+-
+ // Tests that the JavaScript objects returned by statement executions are properly
+ // pretty printed instead of just displaying "[object]".
+ func TestPrettyPrint(t *testing.T) {
+diff --git a/console/testdata/exec.js b/console/testdata/exec.js
+deleted file mode 100644
+index 59e34d7c4033..000000000000
+--- a/console/testdata/exec.js
++++ /dev/null
+@@ -1 +0,0 @@
+-var execed = "some-executed-string";
