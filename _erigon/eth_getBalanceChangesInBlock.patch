@@ -1,0 +1,204 @@
+From 7f97e772ec9d32ca14e98299ff8ab93973427068 Mon Sep 17 00:00:00 2001
+From: Levi Aul <levi@leviaul.com>
+Date: Sat, 2 Jul 2022 10:56:15 -0700
+Subject: [PATCH 1/2] Add eth_getBalanceChangesInBlock RPC endpoint
+
+---
+ cmd/rpcdaemon/commands/eth_api_test.go        | 14 +++
+ .../commands/eth_get_balance_changes.go       | 97 +++++++++++++++++++
+ 2 files changed, 111 insertions(+)
+ create mode 100644 cmd/rpcdaemon/commands/eth_get_balance_changes.go
+
+diff --git a/cmd/rpcdaemon/commands/eth_api_test.go b/cmd/rpcdaemon/commands/eth_api_test.go
+index cc940c43e66..d07ff7da57e 100644
+--- a/cmd/rpcdaemon/commands/eth_api_test.go
++++ b/cmd/rpcdaemon/commands/eth_api_test.go
+@@ -16,6 +16,20 @@ import (
+ 	"github.com/ledgerwatch/erigon/common"
+ )
+ 
++func TestGetBalanceChangesInBlock(t *testing.T) {
++	var myBlockNum uint64 = 5
++
++	db := rpcdaemontest.CreateTestKV(t)
++	stateCache := kvcache.New(kvcache.DefaultCoherentConfig)
++	api := NewEthAPI(NewBaseApi(nil, stateCache, snapshotsync.NewBlockReader(), false), db, nil, nil, nil, 5000000)
++	balances, err := api.GetBalanceChangesInBlock(myBlockNum)
++	if err != nil {
++		t.Errorf("calling GetChangeSet resulted in an error: %v", err)
++	}
++	PrintChangedBalances(balances)
++
++}
++
+ func TestGetTransactionReceipt(t *testing.T) {
+ 	db := rpcdaemontest.CreateTestKV(t)
+ 	stateCache := kvcache.New(kvcache.DefaultCoherentConfig)
+diff --git a/cmd/rpcdaemon/commands/eth_get_balance_changes.go b/cmd/rpcdaemon/commands/eth_get_balance_changes.go
+new file mode 100644
+index 00000000000..081bd69787c
+--- /dev/null
++++ b/cmd/rpcdaemon/commands/eth_get_balance_changes.go
+@@ -0,0 +1,97 @@
++package commands
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++
++	"github.com/holiman/uint256"
++
++	"github.com/ledgerwatch/erigon-lib/kv"
++
++	"github.com/ledgerwatch/erigon/common"
++	"github.com/ledgerwatch/erigon/common/changeset"
++	"github.com/ledgerwatch/erigon/common/dbutils"
++	"github.com/ledgerwatch/erigon/common/hexutil"
++	"github.com/ledgerwatch/erigon/core/types/accounts"
++	"github.com/ledgerwatch/erigon/rpc"
++	"github.com/ledgerwatch/erigon/turbo/rpchelper"
++)
++
++type oldNewBalance struct {
++	oldBalance *hexutil.Big
++	newBalance *hexutil.Big
++}
++
++func (api *APIImpl) GetBalanceChangesInBlock(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (map[common.Address]*hexutil.Big, error) {
++	tx, err := api.db.BeginRo(ctx)
++	if err != nil {
++		return nil, err
++	}
++	defer tx.Rollback()
++
++	blockNumber, _, _, err := rpchelper.GetBlockNumber(blockNrOrHash, tx, api.filters)
++	if err != nil {
++		return nil, err
++	}
++
++	c, err := tx.Cursor(kv.AccountChangeSet)
++	if err != nil {
++		return nil, err
++	}
++	defer c.Close()
++
++	startkey := dbutils.EncodeBlockNumber(blockNumber)
++
++	decodeFn := changeset.Mapper[kv.AccountChangeSet].Decode
++
++	balancesMapping := make(map[common.Address]*hexutil.Big)
++
++	newReader, err := rpchelper.CreateStateReader(ctx, tx, blockNrOrHash, api.filters, api.stateCache)
++	if err != nil {
++		return nil, err
++	}
++
++	for dbKey, dbValue, _ := c.Seek(startkey); bytes.Equal(dbKey, startkey) && dbKey != nil; dbKey, dbValue, _ = c.Next() {
++		_, addressBytes, v, err := decodeFn(dbKey, dbValue)
++		if err != nil {
++			return nil, err
++		}
++
++		var oldAcc accounts.Account
++		if err = oldAcc.DecodeForStorage(v); err != nil {
++			return nil, err
++		}
++		oldBalance := oldAcc.Balance
++
++		address := common.BytesToAddress(addressBytes)
++
++		newAcc, err := newReader.ReadAccountData(address)
++		if err != nil {
++			return nil, err
++		}
++
++		newBalance := uint256.NewInt(0)
++		if newAcc != nil {
++			newBalance = &newAcc.Balance
++		}
++
++		if !oldBalance.Eq(newBalance) {
++			newBalanceDesc := (*hexutil.Big)(newBalance.ToBig())
++			balancesMapping[address] = newBalanceDesc
++		}
++	}
++
++	return balancesMapping, nil
++}
++
++func PrintChangedBalances(mapping map[common.Address]oldNewBalance) error {
++
++	for address, balances := range mapping {
++		fmt.Println("address: ", address)
++		fmt.Println("old balance: ", balances.oldBalance)
++		fmt.Println("new balance: ", balances.newBalance)
++	}
++
++	return nil
++}
+
+From 8f5398e97af3889d625ab5d13b4e69fd8202f589 Mon Sep 17 00:00:00 2001
+From: Levi Aul <levi@leviaul.com>
+Date: Sat, 2 Jul 2022 11:43:23 -0700
+Subject: [PATCH 2/2] Fix lints
+
+---
+ cmd/rpcdaemon/commands/eth_api_test.go            |  6 +++---
+ cmd/rpcdaemon/commands/eth_get_balance_changes.go | 13 +++----------
+ 2 files changed, 6 insertions(+), 13 deletions(-)
+
+diff --git a/cmd/rpcdaemon/commands/eth_api_test.go b/cmd/rpcdaemon/commands/eth_api_test.go
+index d07ff7da57e..44ad8552864 100644
+--- a/cmd/rpcdaemon/commands/eth_api_test.go
++++ b/cmd/rpcdaemon/commands/eth_api_test.go
+@@ -17,14 +17,14 @@ import (
+ )
+ 
+ func TestGetBalanceChangesInBlock(t *testing.T) {
+-	var myBlockNum uint64 = 5
++	myBlockNum := rpc.BlockNumberOrHashWithNumber(5)
+ 
+ 	db := rpcdaemontest.CreateTestKV(t)
+ 	stateCache := kvcache.New(kvcache.DefaultCoherentConfig)
+ 	api := NewEthAPI(NewBaseApi(nil, stateCache, snapshotsync.NewBlockReader(), false), db, nil, nil, nil, 5000000)
+-	balances, err := api.GetBalanceChangesInBlock(myBlockNum)
++	balances, err := api.GetBalanceChangesInBlock(context.Background(), myBlockNum)
+ 	if err != nil {
+-		t.Errorf("calling GetChangeSet resulted in an error: %v", err)
++		t.Errorf("calling GetBalanceChangesInBlock resulted in an error: %v", err)
+ 	}
+ 	PrintChangedBalances(balances)
+ 
+diff --git a/cmd/rpcdaemon/commands/eth_get_balance_changes.go b/cmd/rpcdaemon/commands/eth_get_balance_changes.go
+index 081bd69787c..ef9b052edd3 100644
+--- a/cmd/rpcdaemon/commands/eth_get_balance_changes.go
++++ b/cmd/rpcdaemon/commands/eth_get_balance_changes.go
+@@ -18,11 +18,6 @@ import (
+ 	"github.com/ledgerwatch/erigon/turbo/rpchelper"
+ )
+ 
+-type oldNewBalance struct {
+-	oldBalance *hexutil.Big
+-	newBalance *hexutil.Big
+-}
+-
+ func (api *APIImpl) GetBalanceChangesInBlock(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (map[common.Address]*hexutil.Big, error) {
+ 	tx, err := api.db.BeginRo(ctx)
+ 	if err != nil {
+@@ -85,12 +80,10 @@ func (api *APIImpl) GetBalanceChangesInBlock(ctx context.Context, blockNrOrHash
+ 	return balancesMapping, nil
+ }
+ 
+-func PrintChangedBalances(mapping map[common.Address]oldNewBalance) error {
+-
+-	for address, balances := range mapping {
++func PrintChangedBalances(mapping map[common.Address]*hexutil.Big) error {
++	for address, newBalance := range mapping {
+ 		fmt.Println("address: ", address)
+-		fmt.Println("old balance: ", balances.oldBalance)
+-		fmt.Println("new balance: ", balances.newBalance)
++		fmt.Println("new balance: ", newBalance)
+ 	}
+ 
+ 	return nil
